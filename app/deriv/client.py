@@ -201,25 +201,36 @@ class DerivClient:
 
     async def _open_socket(self) -> None:
         """Opens a new socket and assigns self._ws. Does not start the
-        pump or resubscribe -- callers own that ordering (rule 3)."""
-        if self.auth_mode == AUTH_OTP:
-            if not self.account_id:
-                self.account_id = await self._resolve_account_id()
-                self.logger.info(
-                    f"Resolved Deriv account {self.account_id} "
-                    f"(wanted {'real' if self.use_real_account else 'demo'})"
-                )
-            # Rule (OTP): single-use, valid 120s -- minted immediately before
-            # every socket open, including every reconnect. Caching it across
-            # reconnects would fail exactly when it matters, mid-outage.
-            url = await self._exchange_otp(self.account_id)
-        else:
-            url = f"{self.legacy_endpoint}?app_id={self.app_id}"
+        pump or resubscribe -- callers own that ordering (rule 3).
 
+        EVERYTHING in this method -- account resolution, the OTP REST
+        exchange, and the socket connect itself -- runs inside ONE
+        retry-with-backoff loop. A prior version only wrapped the
+        websockets.connect() call, so a failure in account resolution or
+        the OTP exchange (missing httpx, a bad token, a transient network
+        error -- anything) propagated straight out of connect() and killed
+        the whole process instead of retrying. That is exactly the
+        "never crash the process" principle the rest of this bot follows
+        (see run.py's docstrings) -- this method now actually honors it.
+        """
         attempt = 0
         backoff = 1.0
         while not self._closed:
             try:
+                if self.auth_mode == AUTH_OTP:
+                    if not self.account_id:
+                        self.account_id = await self._resolve_account_id()
+                        self.logger.info(
+                            f"Resolved Deriv account {self.account_id} "
+                            f"(wanted {'real' if self.use_real_account else 'demo'})"
+                        )
+                    # Single-use, valid 120s -- minted immediately before every
+                    # socket open, including every reconnect. Caching it across
+                    # reconnects would fail exactly when it matters, mid-outage.
+                    url = await self._exchange_otp(self.account_id)
+                else:
+                    url = f"{self.legacy_endpoint}?app_id={self.app_id}"
+
                 self.logger.info(f"Connecting to Deriv ({self.auth_mode})...")
                 self._ws = await websockets.connect(
                     url, ping_interval=20, ping_timeout=60, close_timeout=5,
@@ -234,9 +245,6 @@ class DerivClient:
                 self.logger.error(f"Deriv connect failed (attempt {attempt}): {exc!r}")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
-                if self.auth_mode == AUTH_OTP:
-                    # the OTP that failed is now stale/expired -- mint a fresh one
-                    url = await self._exchange_otp(self.account_id)
 
     # ---------------------------------------------------------- REST/OTP auth
     def _auth_headers(self) -> dict:
