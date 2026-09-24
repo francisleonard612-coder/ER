@@ -86,11 +86,29 @@ async def run_scan_cycle(
         calibrated = calibration.calibrate(cand.mc.probability)
         stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier)
 
+        # Deriv rejects EXPIRYRANGE barrier offsets with more than 3 decimal
+        # places (ContractBuyValidationError). Rounding to 5 places -- as a
+        # prior version of this code did -- passed Deriv's own high/low
+        # ordering check locally but still got rejected server-side on every
+        # candidate whose barrier distance had a 4th/5th decimal digit.
+        lower_offset = round(cand.lower_barrier - current_price, 3)
+        upper_offset = round(cand.upper_barrier - current_price, 3)
+
+        # A tight candidate (small volatility multiple on a low-volatility
+        # symbol) can round to a degenerate range at 3-decimal precision --
+        # zero width, or even inverted -- which is what Deriv's "This
+        # contract offers no return" rejection was: not a flaky error, but a
+        # real candidate that stopped being a valid range once rounded to
+        # the precision Deriv actually accepts. Skip it before spending a
+        # rate-limited request on something that cannot price.
+        if upper_offset <= lower_offset or lower_offset >= 0 or upper_offset <= 0:
+            continue
+
         try:
             proposal = await client.request_proposal(
                 symbol=symbol, duration_minutes=cand.duration_minutes, stake=stake,
-                lower_barrier=round(cand.lower_barrier - current_price, 5),
-                upper_barrier=round(cand.upper_barrier - current_price, 5),
+                lower_barrier=lower_offset,
+                upper_barrier=upper_offset,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{symbol}: proposal request failed for candidate ({exc!r}) -- skipping candidate")
