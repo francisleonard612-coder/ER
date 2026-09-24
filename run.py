@@ -85,32 +85,41 @@ class Bot:
 
     async def _prime_candles(self):
         for symbol in self.cfg.symbols:
-            try:
-                candles = await self.client.get_candle_history(symbol, CANDLE_GRANULARITY_SECONDS, CANDLE_HISTORY_COUNT)
-                for c in candles:
-                    self.closes_by_symbol[symbol].append(float(c["close"]))
-                self.logger.info(f"{symbol}: primed with {len(candles)} candles")
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"{symbol}: failed to prime candles ({exc!r})")
+            await self._refresh_candles(symbol)
+            self.logger.info(f"{symbol}: primed with {len(self.closes_by_symbol[symbol])} candles")
 
-            def _make_cb(sym):
-                def _cb(msg):
-                    candle = msg.get("candles") or msg.get("ohlc")
-                    if candle is None:
-                        return
-                    if isinstance(candle, list):
-                        for c in candle:
-                            self.closes_by_symbol[sym].append(float(c["close"]))
-                    else:
-                        close = candle.get("close")
-                        if close is not None:
-                            self.closes_by_symbol[sym].append(float(close))
-                return _cb
+    async def _refresh_candles(self, symbol: str) -> None:
+        """Replaces the closes buffer with a fresh, correctly-spaced fetch
+        from get_candle_history.
 
-            try:
-                await self.client.subscribe_candles(symbol, CANDLE_GRANULARITY_SECONDS, CANDLE_HISTORY_COUNT, _make_cb(symbol))
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"{symbol}: candle subscription failed ({exc!r})")
+        NOT built on the candle *subscription* stream on purpose -- that was
+        a real bug found live. Deriv pushes an `ohlc` update on every tick
+        that touches the still-forming candle, not just once per completed
+        minute (standard behavior for a live OHLC feed). The previous
+        version's subscription callback had no concept of "same candle,
+        still forming" vs "a new candle started" and appended every single
+        push as if it were an independent new 1-minute close. For fast
+        symbols (1HZ10V ticks ~1/sec, R_10 ~1 every couple seconds), that
+        meant most of the ~300 buffered "candles" were near-duplicate
+        intra-minute snapshots rather than genuinely minute-apart prices --
+        which silently crushed the computed volatility regardless of window
+        length, and was the real cause of the implausibly large edges seen
+        in production (raw_p up to 1.000, payout up to ~4.9x). Refetching
+        the finalized history via get_candle_history every scan avoids that
+        whole class of bug -- it's the same method already used (and
+        trusted) for the initial prime, which returns properly deduplicated,
+        epoch-sorted bars.
+        """
+        try:
+            candles = await self.client.get_candle_history(symbol, CANDLE_GRANULARITY_SECONDS, CANDLE_HISTORY_COUNT)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(f"{symbol}: candle refresh failed (non-fatal, using previous history): {exc!r}")
+            return
+        if not candles:
+            return
+        self.closes_by_symbol[symbol].clear()
+        for c in candles:
+            self.closes_by_symbol[symbol].append(float(c["close"]))
 
     async def _on_reconnect(self):
         # rolling in-memory state (tick buffers etc.) survives in this process;
@@ -133,6 +142,7 @@ class Bot:
                 pass
 
     async def _scan_symbol(self, symbol: str):
+        await self._refresh_candles(symbol)
         closes = np.array(self.closes_by_symbol[symbol], dtype=float)
         if len(closes) == 0:
             return
