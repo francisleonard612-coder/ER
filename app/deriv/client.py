@@ -1,217 +1,490 @@
 """
-Deriv WebSocket connection layer.
+Deriv WebSocket connection layer -- v2.
 
-Uses the current production endpoint (`wss://ws.derivws.com/websockets/v3`).
-The older `wss://ws.binaryws.com/...` host still resolves for some accounts
-but has been superseded — see api.deriv.com. This client is written against
-the plain `websockets` library rather than the `@deriv/deriv-api` JS SDK or
-the `python_deriv_api` wrapper, so reconnect/backoff/resubscribe behaviour
-is fully explicit and controllable for a long-running Railway service.
+=====================================================================
+WHY THIS CHANGED FROM v1, AND WHAT WAS AND WASN'T PORTED FROM THE
+EXTERNAL REFERENCE FILE THIS WAS BASED ON (a "Reversal-System" repo's
+deriv/client.py). Both points below were independently verified
+against Deriv's own current documentation (developers.deriv.com) before
+being adopted -- nothing here was ported on the reference file's word
+alone.
+=====================================================================
 
-Responsibilities:
-- connect / authorize / reconnect with exponential backoff
-- heartbeat (ping) so idle connections aren't dropped by the server or LB
-- request/response correlation via req_id
-- tick + candle subscriptions that auto-resubscribe after a reconnect
-- proposal and buy calls
-- never raise out of the read loop on a single bad frame — log and continue
+1. DERIV HAS A NEW API GENERATION. Confirmed live against
+   developers.deriv.com/llms/*.md: the "New API" (product name
+   "Options") uses a REST OTP exchange for WebSocket auth instead of
+   the legacy post-connect `{"authorize": token}` message, connects to
+   `wss://api.derivws.com/trading/v1/options/ws/{demo|real|public}`
+   instead of `wss://ws.derivws.com/websockets/v3`, and renames the
+   `proposal` request's `symbol` field to `underlying_symbol`.
+   EXPIRYRANGE (our contract type) is confirmed present in the current
+   `contract_type` enum. `ticks`/`ticks_history` are NOT affected --
+   those calls take the symbol as the *value* of the `ticks`/
+   `ticks_history` key itself, not a separately-named field, so no
+   rename applies there.
+
+   NOT ported: the reference file's claim of a special 360/minute
+   budget shared across proposal/proposal_open_contract/buy/sell.
+   Deriv's current docs (api-overview.md) state the limit is 100
+   requests/second per connection, generically -- no narrower
+   per-message-family budget is documented. `_RateLimiter` below paces
+   against the documented number, not the unverified one.
+
+2. A REAL DEADLOCK BUG IN OUR OWN v1 CLIENT, found by cross-checking
+   the reference file's rules 1-3 against our code rather than by
+   independent testing. v1's `_read_loop()` was the only coroutine
+   that read the socket, but on `ConnectionClosed` it called
+   `_handle_disconnect()` -- INLINE, in the same coroutine -- which
+   then tried to resubscribe via `send()`, which awaits a future that
+   only the read loop can resolve. Since the read loop was itself
+   blocked inside `_handle_disconnect` at that point, every resubscribe
+   after every reconnect would have hung for the full request timeout.
+   This was never hit in your logs yet only because the bot never
+   reached a successful connect to reconnect FROM (see the 520 issue).
+   It would have surfaced the first time a real disconnect happened
+   after a real connect.
+
+   Fixed the way the reference file fixes it: the socket reader
+   (`_recv_pump`) is its own task, never doing the reconnecting itself.
+   A single long-lived `_supervise_pump` task watches it and reconnects
+   whenever it exits, for any reason. `_reconnect()` starts the NEW
+   pump task on the new socket BEFORE resubscribing anything -- so the
+   resubscribe requests always have a live reader able to resolve their
+   futures.
+
+Everything else (idempotent single-attempt buy, subscribed rather than
+polled settlement, `.state` instead of the removed `.closed` property)
+carries the same public method signatures as v1
+(`connect`, `close`, `request_proposal`, `buy_contract`,
+`subscribe_candles`, `subscribe_contract`, `get_candle_history`,
+`balance`) so `run.py` and `app/strategy/engine.py` did not need to
+change.
+
+REQUIRES: `httpx` for the REST OTP exchange (`pip install httpx`, or
+add it to requirements.txt) when using the default OTP auth mode.
+`auth_mode="legacy"` keeps the old connect-then-authorize flow against
+`wss://ws.derivws.com/websockets/v3` and needs no extra dependency --
+useful as a fallback if OTP auth is ever unavailable for your account.
+
+NEW OPTIONAL ENV VARS (all have safe defaults, nothing else needs to
+change to pick them up since DerivClient reads them itself when not
+passed explicitly):
+  DERIV_API_BASE_URL   default "https://api.derivws.com"
+  DERIV_AUTH_MODE      default "otp"  (or "legacy")
+  DERIV_ACCOUNT_ID     default unset -- auto-resolved (demo/real) via
+                        GET /trading/v1/options/accounts on first
+                        connect if not set
 """
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
+import os
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State as WsState
+
+AUTH_OTP = "otp"
+AUTH_LEGACY = "legacy"
 
 
 class DerivAPIError(Exception):
-    def __init__(self, code: str, message: str, raw: dict):
+    def __init__(self, code: str, message: str, raw: dict | None = None):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
-        self.raw = raw
+        self.raw = raw or {}
+
+
+class DerivAuthError(DerivAPIError):
+    def __init__(self, message: str):
+        super().__init__("AuthFailed", message)
+
+
+class BuyAmbiguousError(DerivAPIError):
+    """Raised when a buy's outcome could not be confirmed (timeout or
+    disconnect mid-request). The buy may or may not have gone through.
+    Callers MUST reconcile via `portfolio()` rather than retry --
+    retrying a buy whose first attempt actually succeeded opens a
+    second contract."""
 
 
 @dataclass
 class Subscription:
-    request: Dict[str, Any]
-    callback: Callable[[dict], None]
-    subscription_id: Optional[str] = None
+    request: dict
+    callback: "callable"
+    subscription_id: str | None = None
+
+
+class _RateLimiter:
+    """Sliding-window limiter paced to Deriv's documented 100 req/sec
+    per connection (api-overview.md). Waits before sending rather than
+    firing and handling a 429 after the fact -- a rejected request
+    still cost a round trip and still leaves the caller with nothing."""
+
+    def __init__(self, max_per_window: int = 80, window_seconds: float = 1.0):
+        self.max_per_window = max_per_window
+        self.window_seconds = window_seconds
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                cutoff = now - self.window_seconds
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+                if len(self._timestamps) < self.max_per_window:
+                    self._timestamps.append(now)
+                    return
+                await asyncio.sleep(max(self._timestamps[0] - cutoff, 0.01))
 
 
 class DerivClient:
     def __init__(self, endpoint: str, app_id: str, api_token: str, logger,
-                 on_reconnect: Optional[Callable[[], "asyncio.Future"]] = None):
-        self.base_endpoint = endpoint
+                 on_reconnect=None, *,
+                 api_base_url: str | None = None,
+                 auth_mode: str | None = None,
+                 use_real_account: bool | None = None,
+                 account_id: str | None = None,
+                 request_timeout: float = 15.0,
+                 max_requests_per_second: int = 80):
+        self.legacy_endpoint = endpoint  # only used when auth_mode == "legacy"
         self.app_id = app_id
         self.api_token = api_token
         self.logger = logger
         self.on_reconnect = on_reconnect
 
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._req_id_counter = itertools.count(1)
-        self._pending: Dict[int, asyncio.Future] = {}
-        self._subscriptions: Dict[str, Subscription] = {}  # keyed by our local key
-        self._connected = asyncio.Event()
-        self._closing = False
-        self._read_task: Optional[asyncio.Task] = None
-        self._ping_task: Optional[asyncio.Task] = None
-        self._reconnect_delay = 1.0
-        self.authorized = False
-        self.account_info: Dict[str, Any] = {}
+        self.api_base_url = (api_base_url or os.getenv("DERIV_API_BASE_URL", "https://api.derivws.com")).rstrip("/")
+        self.auth_mode = auth_mode or os.getenv("DERIV_AUTH_MODE", AUTH_OTP)
+        if use_real_account is None:
+            use_real_account = os.getenv("DERIV_ACCOUNT_MODE", "DEMO").upper() == "LIVE"
+        self.use_real_account = use_real_account
+        self.account_id = account_id or os.getenv("DERIV_ACCOUNT_ID") or None
+        self.request_timeout = request_timeout
 
-    @property
-    def url(self) -> str:
-        return f"{self.base_endpoint}?app_id={self.app_id}"
+        self._ws = None
+        self._req_id_counter = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._subscriptions: dict[str, Subscription] = {}
+        self._contract_queues: dict[str, asyncio.Queue] = {}
 
-    # ---------------------------------------------------------------- lifecycle
+        self._pump_task: asyncio.Task | None = None
+        self._supervisor_task: asyncio.Task | None = None
+        self._connect_lock = asyncio.Lock()
+        self._closed = False
+        self.last_message_at: float = 0.0
+        self.rate_limiter = _RateLimiter(max_per_window=max_requests_per_second)
+
+    # ------------------------------------------------------------- lifecycle
     async def connect(self) -> None:
-        self._closing = False
-        await self._connect_once()
-        self._read_task = asyncio.create_task(self._read_loop())
-        self._ping_task = asyncio.create_task(self._ping_loop())
-
-    async def _connect_once(self) -> None:
-        attempt = 0
-        while not self._closing:
-            try:
-                self.logger.info(f"Connecting to Deriv: {self.base_endpoint} (app_id={self.app_id})")
-                self._ws = await websockets.connect(self.url, ping_interval=None, close_timeout=5)
-                self._connected.set()
-                self._reconnect_delay = 1.0
-                self.logger.info("Deriv WebSocket connected")
-                if self.api_token:
-                    await self.authorize(self.api_token)
-                return
-            except Exception as exc:  # noqa: BLE001 - must never crash the process
-                attempt += 1
-                self.logger.error(f"Deriv connect failed (attempt {attempt}): {exc!r}")
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+        self._closed = False
+        async with self._connect_lock:
+            await self._open_socket()
+            # Rule 3: reader task exists before anything else can need it.
+            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
+        # Rule 2: exactly one long-lived supervisor for the client's whole life.
+        self._supervisor_task = asyncio.create_task(self._supervise_pump(), name="deriv-pump-supervisor")
+        self.logger.info(f"Deriv connected (auth_mode={self.auth_mode})")
 
     async def close(self) -> None:
-        self._closing = True
-        for task in (self._read_task, self._ping_task):
-            if task:
-                task.cancel()
+        self._closed = True
+        for t in (self._pump_task, self._supervisor_task):
+            if t:
+                t.cancel()
         if self._ws is not None:
             await self._ws.close()
         self.logger.info("Deriv WebSocket closed cleanly")
 
-    # ------------------------------------------------------------------ reads
-    async def _read_loop(self) -> None:
-        while not self._closing:
-            try:
-                if self._ws is None:
-                    await asyncio.sleep(0.5)
-                    continue
-                raw = await self._ws.recv()
-                msg = json.loads(raw)
-            except ConnectionClosed as exc:
-                self.logger.warning(f"Deriv connection closed: {exc!r} — reconnecting")
-                await self._handle_disconnect()
-                continue
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"Deriv read error (non-fatal): {exc!r}")
-                await asyncio.sleep(0.5)
-                continue
-
-            self._dispatch(msg)
-
-    def _dispatch(self, msg: dict) -> None:
-        if msg.get("error"):
-            err = msg["error"]
-            req_id = msg.get("req_id")
-            if req_id in self._pending:
-                self._pending[req_id].set_exception(
-                    DerivAPIError(err.get("code", "UNKNOWN"), err.get("message", ""), msg)
+    async def _open_socket(self) -> None:
+        """Opens a new socket and assigns self._ws. Does not start the
+        pump or resubscribe -- callers own that ordering (rule 3)."""
+        if self.auth_mode == AUTH_OTP:
+            if not self.account_id:
+                self.account_id = await self._resolve_account_id()
+                self.logger.info(
+                    f"Resolved Deriv account {self.account_id} "
+                    f"(wanted {'real' if self.use_real_account else 'demo'})"
                 )
-                del self._pending[req_id]
-            else:
-                self.logger.error(f"Deriv API error (unsolicited): {err}")
-            return
+            # Rule (OTP): single-use, valid 120s -- minted immediately before
+            # every socket open, including every reconnect. Caching it across
+            # reconnects would fail exactly when it matters, mid-outage.
+            url = await self._exchange_otp(self.account_id)
+        else:
+            url = f"{self.legacy_endpoint}?app_id={self.app_id}"
 
+        attempt = 0
+        backoff = 1.0
+        while not self._closed:
+            try:
+                self.logger.info(f"Connecting to Deriv ({self.auth_mode})...")
+                self._ws = await websockets.connect(
+                    url, ping_interval=20, ping_timeout=60, close_timeout=5,
+                    max_size=4 * 1024 * 1024,
+                )
+                self.last_message_at = time.time()
+                if self.auth_mode == AUTH_LEGACY and self.api_token:
+                    await self._legacy_authorize()
+                return
+            except Exception as exc:  # noqa: BLE001 - must never crash the process
+                attempt += 1
+                self.logger.error(f"Deriv connect failed (attempt {attempt}): {exc!r}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                if self.auth_mode == AUTH_OTP:
+                    # the OTP that failed is now stale/expired -- mint a fresh one
+                    url = await self._exchange_otp(self.account_id)
+
+    # ---------------------------------------------------------- REST/OTP auth
+    def _auth_headers(self) -> dict:
+        return {"Deriv-App-ID": str(self.app_id), "Authorization": f"Bearer {self.api_token}"}
+
+    @staticmethod
+    def _http_client():
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover
+            raise DerivAuthError(
+                "auth_mode='otp' requires httpx: pip install httpx, or set "
+                "DERIV_AUTH_MODE=legacy to use the old connect-then-authorize flow"
+            ) from exc
+        return httpx.AsyncClient(timeout=15.0)
+
+    async def _resolve_account_id(self) -> str:
+        if not self.api_token:
+            raise DerivAuthError("DERIV_API_TOKEN is not set")
+        url = f"{self.api_base_url}/trading/v1/options/accounts"
+        async with self._http_client() as client:
+            resp = await client.get(url, headers=self._auth_headers())
+        if resp.status_code != 200:
+            raise DerivAuthError(
+                f"fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]} "
+                f"(token_len={len(self.api_token)}, "
+                f"token_has_surrounding_whitespace={self.api_token != self.api_token.strip()}, "
+                f"app_id={self.app_id!r})"
+            )
+        body = resp.json()
+        accounts = body.get("data") or body.get("accounts") or (body if isinstance(body, list) else [])
+        if not accounts:
+            raise DerivAuthError(f"no Options accounts for this token: {body}")
+
+        wanted = "real" if self.use_real_account else "demo"
+        for acc in accounts:
+            kind = str(acc.get("type") or acc.get("account_type") or "").lower()
+            if kind == wanted:
+                account_id = acc.get("account_id") or acc.get("id")
+                if account_id:
+                    return account_id
+
+        first = accounts[0]
+        account_id = first.get("account_id") or first.get("id")
+        if not account_id:
+            raise DerivAuthError(f"account entry had no id field: {first}")
+        self.logger.warning(f"no {wanted!r} account found; falling back to {account_id}")
+        return account_id
+
+    async def _exchange_otp(self, account_id: str) -> str:
+        if not self.api_token:
+            raise DerivAuthError("DERIV_API_TOKEN is not set")
+        url = f"{self.api_base_url}/trading/v1/options/accounts/{account_id}/otp"
+        async with self._http_client() as client:
+            resp = await client.post(url, headers=self._auth_headers())
+        if resp.status_code != 200:
+            raise DerivAuthError(f"OTP exchange failed: HTTP {resp.status_code} {resp.text[:300]}")
+        body = resp.json()
+        data = body.get("data", body)
+        auth_url = data.get("url") or data.get("websocket_url") or data.get("ws_url")
+        if not auth_url:
+            raise DerivAuthError(f"OTP response had no usable URL: {body}")
+        return auth_url
+
+    async def _legacy_authorize(self) -> None:
+        await self._send_raw({"authorize": self.api_token})
+
+    # ------------------------------------------------------------- read pump
+    async def _recv_pump(self) -> None:
+        """THE ONLY coroutine that reads the socket (rule 1). Never awaits a
+        handler -- everything it does is synchronous: put_nowait onto a
+        queue, or set_result on a pending future."""
+        try:
+            async for raw in self._ws:
+                self.last_message_at = time.time()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    self.logger.warning("Deriv: undecodable frame dropped")
+                    continue
+                self._route(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(f"Deriv pump exited: {exc!r}")
+        finally:
+            for fut in list(self._pending.values()):
+                if not fut.done():
+                    fut.set_exception(DerivAPIError("Disconnected", "socket closed"))
+            self._pending.clear()
+
+    def _route(self, msg: dict) -> None:
         req_id = msg.get("req_id")
-        if req_id in self._pending:
-            self._pending[req_id].set_result(msg)
-            del self._pending[req_id]
-            return
+        if req_id is not None and req_id in self._pending:
+            fut = self._pending.pop(req_id)
+            if not fut.done():
+                if "error" in msg:
+                    err = msg["error"]
+                    fut.set_exception(DerivAPIError(err.get("code", "Unknown"), err.get("message", ""), msg))
+                else:
+                    fut.set_result(msg)
+            # A subscribe call's own response also carries the first payload
+            # and the subscription id -- route it below too so no opening
+            # tick/candle/contract state is ever lost.
 
-        # subscription push (tick, ohlc, proposal_open_contract stream, etc.)
         sub_id = (msg.get("subscription") or {}).get("id")
         for sub in self._subscriptions.values():
-            if sub.subscription_id == sub_id:
+            if sub.subscription_id and sub.subscription_id == sub_id:
                 try:
                     sub.callback(msg)
                 except Exception as exc:  # noqa: BLE001
-                    self.logger.error(f"Subscription callback error (non-fatal): {exc!r}")
+                    self.logger.error(f"Deriv subscription callback error (non-fatal): {exc!r}")
                 return
 
-    async def _handle_disconnect(self) -> None:
-        self._connected.clear()
-        self.authorized = False
-        self._ws = None
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(ConnectionClosed(None, None))
-        self._pending.clear()
-        await self._connect_once()
-        # resubscribe everything that was active before the drop
-        for key, sub in list(self._subscriptions.items()):
+        if msg.get("msg_type") == "proposal_open_contract":
+            poc = msg.get("proposal_open_contract") or {}
+            q = self._contract_queues.get(str(poc.get("contract_id")))
+            if q is not None:
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                q.put_nowait(poc)
+
+    async def _supervise_pump(self) -> None:
+        """Rule 2: reconnects whenever the pump exits, for any reason. One
+        long-lived instance for the client's whole life -- never re-spawned
+        per reconnect, or two supervisors race to read the same socket."""
+        backoff = 1.0
+        while not self._closed:
             try:
-                sub.subscription_id = await self._resubscribe(sub)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"Resubscribe failed for {key}: {exc!r}")
+                if self._pump_task:
+                    await self._pump_task
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            if self._closed:
+                return
+            self.logger.warning("Deriv pump exited -- reconnecting")
+            while not self._closed:
+                await asyncio.sleep(backoff)
+                try:
+                    await self._reconnect()
+                    backoff = 1.0
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    backoff = min(backoff * 2, 30.0)
+                    self.logger.error(f"Deriv reconnect failed ({exc!r}); next attempt in {backoff:.1f}s")
+
+    async def ensure_connected(self) -> None:
+        """Reconnects a dead socket from the request path. THE OPEN CHECK IS
+        OUTSIDE THE LOCK ON PURPOSE: _reconnect() holds _connect_lock while
+        resubscribing, and resubscribing goes through _send() ->
+        ensure_connected(). asyncio.Lock is not reentrant, so acquiring the
+        lock before checking would deadlock the first resubscribe of every
+        reconnect against itself."""
+        if self._ws is not None and self._ws.state is WsState.OPEN:
+            return
+        await self._reconnect()
+
+    async def _reconnect(self) -> None:
+        async with self._connect_lock:
+            if self._ws is not None and self._ws.state is WsState.OPEN:
+                return  # someone else reconnected while this caller waited
+            await self._open_socket()
+            # RULE 3, the whole point: start the reader on the NEW socket
+            # before any resubscribe, because resubscribes await responses
+            # only the reader can deliver.
+            self._pump_task = asyncio.create_task(self._recv_pump(), name="deriv-pump")
+            for key, sub in list(self._subscriptions.items()):
+                try:
+                    resp = await self.send(sub.request)
+                    sub.subscription_id = (resp.get("subscription") or {}).get("id")
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(f"Deriv: failed to resubscribe {key}: {exc!r}")
         if self.on_reconnect:
             await self.on_reconnect()
 
-    async def _resubscribe(self, sub: Subscription) -> Optional[str]:
-        resp = await self.send(sub.request)
-        return (resp.get("subscription") or {}).get("id")
-
-    async def _ping_loop(self) -> None:
-        while not self._closing:
-            await asyncio.sleep(20)
-            if self._ws is not None:
-                try:
-                    await self.send({"ping": 1})
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.warning(f"Ping failed (non-fatal): {exc!r}")
-
-    # ------------------------------------------------------------------ send
-    async def send(self, payload: dict, timeout: float = 15.0) -> dict:
-        await self._connected.wait()
-        req_id = next(self._req_id_counter)
+    # ------------------------------------------------------- request/response
+    async def _send_raw(self, payload: dict, timeout: float | None = None) -> dict:
+        """Sends without pacing or auto-reconnect -- only for use during the
+        connect/auth sequence itself, before rate limiting or resubscribe
+        logic would make sense."""
+        self._req_id_counter += 1
+        req_id = self._req_id_counter
         payload = {**payload, "req_id": req_id}
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._pending[req_id] = fut
         try:
             await self._ws.send(json.dumps(payload))
-        except Exception:
+            return await asyncio.wait_for(fut, timeout=timeout or self.request_timeout)
+        finally:
             self._pending.pop(req_id, None)
-            raise
+
+    async def send(self, payload: dict, timeout: float | None = None) -> dict:
+        await self.rate_limiter.acquire()
+        await self.ensure_connected()
+        if self._ws is None or self._ws.state is not WsState.OPEN:
+            raise DerivAPIError("Disconnected", "socket is not open")
+        self._req_id_counter += 1
+        req_id = self._req_id_counter
+        payload = {**payload, "req_id": req_id}
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
         try:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            await self._ws.send(json.dumps(payload))
+            return await asyncio.wait_for(fut, timeout=timeout or self.request_timeout)
         except asyncio.TimeoutError:
+            raise DerivAPIError("Timeout", f"no response within {timeout or self.request_timeout}s")
+        finally:
             self._pending.pop(req_id, None)
-            raise TimeoutError(f"Deriv request timed out: {payload.get('msg_type', list(payload.keys()))}")
 
-    async def authorize(self, token: str) -> dict:
-        resp = await self.send({"authorize": token})
-        self.authorized = True
-        self.account_info = resp.get("authorize", {})
-        loginid = self.account_info.get("loginid", "?")
-        is_virtual = self.account_info.get("is_virtual", 1)
-        self.logger.info(f"Authorized as {loginid} (virtual={bool(is_virtual)})")
-        return resp
+    # ------------------------------------------------------------ high level
+    async def get_candle_history(self, symbol: str, granularity_seconds: int, count: int) -> list[dict]:
+        resp = await self.send({
+            "ticks_history": symbol, "style": "candles",
+            "granularity": granularity_seconds, "count": min(count, 5000),
+            "end": "latest", "adjust_start_time": 1,
+        })
+        raw = resp.get("candles", [])
+        out = []
+        for i, c in enumerate(raw if isinstance(raw, list) else []):
+            try:
+                out.append({
+                    "epoch": int(c["epoch"]), "open": float(c["open"]), "high": float(c["high"]),
+                    "low": float(c["low"]), "close": float(c["close"]),
+                })
+            except (KeyError, TypeError, ValueError) as exc:
+                self.logger.warning(f"{symbol}: skipping malformed candle at index {i}: {exc}")
+        out.sort(key=lambda c: c["epoch"])
+        return out
 
-    # ------------------------------------------------------------- high level
-    async def subscribe_ticks(self, symbol: str, callback: Callable[[dict], None]) -> str:
+    async def subscribe_candles(self, symbol: str, granularity_seconds: int, count: int, callback) -> str:
+        key = f"candles:{symbol}:{granularity_seconds}"
+        request = {
+            "ticks_history": symbol, "style": "candles", "granularity": granularity_seconds,
+            "count": count, "subscribe": 1, "end": "latest",
+        }
+        resp = await self.send(request)
+        sub_id = (resp.get("subscription") or {}).get("id")
+        self._subscriptions[key] = Subscription(request=request, callback=callback, subscription_id=sub_id)
+        return key
+
+    async def subscribe_ticks(self, symbol: str, callback) -> str:
         key = f"ticks:{symbol}"
         request = {"ticks": symbol, "subscribe": 1}
         resp = await self.send(request)
@@ -219,60 +492,58 @@ class DerivClient:
         self._subscriptions[key] = Subscription(request=request, callback=callback, subscription_id=sub_id)
         return key
 
-    async def subscribe_candles(self, symbol: str, granularity_seconds: int,
-                                 count: int, callback: Callable[[dict], None]) -> str:
-        key = f"candles:{symbol}:{granularity_seconds}"
-        request = {
-            "ticks_history": symbol,
-            "style": "candles",
-            "granularity": granularity_seconds,
-            "count": count,
-            "subscribe": 1,
-            "end": "latest",
-        }
-        resp = await self.send(request)
-        sub_id = (resp.get("subscription") or {}).get("id")
-        self._subscriptions[key] = Subscription(request=request, callback=callback, subscription_id=sub_id)
-        return key
-
-    async def get_candle_history(self, symbol: str, granularity_seconds: int, count: int) -> List[dict]:
-        resp = await self.send({
-            "ticks_history": symbol,
-            "style": "candles",
-            "granularity": granularity_seconds,
-            "count": count,
-            "end": "latest",
-        })
-        return resp.get("candles", [])
-
     async def request_proposal(self, symbol: str, duration_minutes: int, stake: float,
                                 lower_barrier: float, upper_barrier: float,
                                 currency: str = "USD") -> dict:
-        """EXPIRYRANGE == Deriv's 'ENDSINOUT' / 'Ends Between' contract type."""
+        """EXPIRYRANGE == Deriv's "Ends Between" contract. `underlying_symbol`
+        (not `symbol`) per the current API -- confirmed in
+        developers.deriv.com/llms/contract-types.md."""
         resp = await self.send({
-            "proposal": 1,
-            "amount": stake,
-            "basis": "stake",
-            "contract_type": "EXPIRYRANGE",
-            "currency": currency,
-            "duration": duration_minutes,
-            "duration_unit": "m",
-            "symbol": symbol,
+            "proposal": 1, "amount": stake, "basis": "stake",
+            "contract_type": "EXPIRYRANGE", "currency": currency,
+            "duration": duration_minutes, "duration_unit": "m",
+            "underlying_symbol": symbol,
             "barrier": f"+{lower_barrier}" if lower_barrier >= 0 else str(lower_barrier),
             "barrier2": f"+{upper_barrier}" if upper_barrier >= 0 else str(upper_barrier),
         })
         return resp.get("proposal", {})
 
     async def buy_contract(self, proposal_id: str, price: float) -> dict:
-        resp = await self.send({"buy": proposal_id, "price": price})
+        """Exactly one attempt, ever. On an ambiguous failure (timeout or
+        disconnect) the outcome is genuinely unknown -- the buy may have
+        been accepted. Raises BuyAmbiguousError so the caller can reconcile
+        via portfolio() instead of retrying (a retry that lands after a
+        successful first attempt opens a second contract)."""
+        try:
+            resp = await self.send({"buy": proposal_id, "price": round(float(price), 2)})
+        except DerivAPIError as exc:
+            if exc.code in ("Timeout", "Disconnected"):
+                raise BuyAmbiguousError(
+                    "BuyAmbiguous",
+                    f"buy outcome unknown for proposal {proposal_id} ({exc.code}) -- "
+                    f"reconcile via portfolio(), do not retry",
+                ) from exc
+            raise
         return resp.get("buy", {})
 
-    async def subscribe_contract(self, contract_id: str, callback: Callable[[dict], None]) -> str:
+    async def portfolio(self) -> list[dict]:
+        resp = await self.send({"portfolio": 1})
+        return resp.get("portfolio", {}).get("contracts", [])
+
+    async def subscribe_contract(self, contract_id: str, callback) -> str:
         key = f"contract:{contract_id}"
+        if contract_id not in self._contract_queues:
+            self._contract_queues[contract_id] = asyncio.Queue(maxsize=50)
         request = {"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1}
         resp = await self.send(request)
         sub_id = (resp.get("subscription") or {}).get("id")
         self._subscriptions[key] = Subscription(request=request, callback=callback, subscription_id=sub_id)
+        poc = resp.get("proposal_open_contract")
+        if poc:
+            try:
+                callback({"proposal_open_contract": poc, "subscription": {"id": sub_id}})
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"Deriv: initial contract callback failed (non-fatal): {exc!r}")
         return key
 
     async def balance(self) -> dict:
