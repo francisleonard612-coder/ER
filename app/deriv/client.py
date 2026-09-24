@@ -505,14 +505,24 @@ class DerivClient:
                                 currency: str = "USD") -> dict:
         """EXPIRYRANGE == Deriv's "Ends Between" contract. `underlying_symbol`
         (not `symbol`) per the current API -- confirmed in
-        developers.deriv.com/llms/contract-types.md."""
+        developers.deriv.com/llms/contract-types.md.
+
+        Field-to-value mapping confirmed against developers.deriv.com/docs/
+        ends-between: `barrier` is the HIGH barrier offset, `barrier2` is the
+        LOW barrier offset -- despite `barrier2`'s generic schema description
+        elsewhere just saying "low barrier" without saying `barrier` is high.
+        Getting this backwards produces a 100%-reproducible
+        `InvalidHighBarrier: High barrier must be higher than low barrier`
+        from Deriv on every single candidate, which is exactly what an
+        earlier version of this method did.
+        """
         resp = await self.send({
             "proposal": 1, "amount": stake, "basis": "stake",
             "contract_type": "EXPIRYRANGE", "currency": currency,
             "duration": duration_minutes, "duration_unit": "m",
             "underlying_symbol": symbol,
-            "barrier": f"+{lower_barrier}" if lower_barrier >= 0 else str(lower_barrier),
-            "barrier2": f"+{upper_barrier}" if upper_barrier >= 0 else str(upper_barrier),
+            "barrier": f"+{upper_barrier}" if upper_barrier >= 0 else str(upper_barrier),
+            "barrier2": f"+{lower_barrier}" if lower_barrier >= 0 else str(lower_barrier),
         })
         return resp.get("proposal", {})
 
