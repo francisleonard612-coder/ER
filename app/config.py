@@ -63,7 +63,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: _env_list(
             "SYMBOLS",
-            ["R_10", "R_25", "R_50", "R_75", "R_100"],
+            ["R_10", "1HZ10V"],
         )
     )
 
