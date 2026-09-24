@@ -86,13 +86,14 @@ async def run_scan_cycle(
         calibrated = calibration.calibrate(cand.mc.probability)
         stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier)
 
-        # Deriv rejects EXPIRYRANGE barrier offsets with more than 3 decimal
-        # places (ContractBuyValidationError). Rounding to 5 places -- as a
-        # prior version of this code did -- passed Deriv's own high/low
-        # ordering check locally but still got rejected server-side on every
-        # candidate whose barrier distance had a 4th/5th decimal digit.
-        lower_offset = round(cand.lower_barrier - current_price, 3)
-        upper_offset = round(cand.upper_barrier - current_price, 3)
+        # Deriv rejects EXPIRYRANGE barrier offsets past a symbol-specific
+        # decimal limit (ContractBuyValidationError) -- confirmed different
+        # per symbol in production: R_10 accepted 3 places, 1HZ10V only 2.
+        # Rounding to 2 satisfies both observed limits; if a future symbol
+        # needs even less precision this will need per-symbol pip_size
+        # discovery via active_symbols rather than a single constant.
+        lower_offset = round(cand.lower_barrier - current_price, 2)
+        upper_offset = round(cand.upper_barrier - current_price, 2)
 
         # A tight candidate (small volatility multiple on a low-volatility
         # symbol) can round to a degenerate range at 3-decimal precision --
