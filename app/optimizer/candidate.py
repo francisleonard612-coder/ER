@@ -63,10 +63,41 @@ def build_candidates(
     vol_multiples: List[float],
     trade_threshold_probability: float,
     mc_config,
+    *,
+    regime_name: str = "",
+    regime_confidence: float = 0.0,
+    calm_regimes: tuple = ("LOW_VOLATILITY_RANGE", "VOLATILITY_CONTRACTION"),
+    calm_regime_confidence_floor: float = 0.6,
+    non_calm_max_duration_minutes: int = 4,
 ) -> List[BarrierCandidate]:
+    """
+    Duration ceiling tied to regime: the full duration grid (up to its max,
+    e.g. 10 minutes) is only offered when the market is in a calm regime
+    (regime_name in calm_regimes) AND the regime read is itself confident
+    enough (regime_confidence >= calm_regime_confidence_floor). Otherwise
+    duration is capped at non_calm_max_duration_minutes.
+
+    Why: real price dispersion grows with sqrt(duration) (see the distance
+    formula below), so a longer contract is a genuinely higher-variance bet
+    -- taking it isn't free edge, it's a different, riskier point on a fair
+    curve. The one legitimate source of edge here is that volatility
+    clusters: a currently-calm market tends to stay calmer than its
+    blended historical average for a while, which is exactly what our
+    Monte Carlo pool (built from the FULL history) doesn't know on its own.
+    So longer, riskier durations are only offered when the regime detector
+    is actually telling us "calm," and telling us so with real confidence
+    -- not just whenever the duration grid happens to reach that far.
+    """
     candidates: List[BarrierCandidate] = []
 
+    is_calm_and_confident = (
+        regime_name in calm_regimes and regime_confidence >= calm_regime_confidence_floor
+    )
+    effective_duration_ceiling = max(durations_minutes) if is_calm_and_confident else non_calm_max_duration_minutes
+
     for duration in durations_minutes:
+        if duration > effective_duration_ceiling:
+            continue
         pool = returns_pool_by_step.get(duration)
         if pool is None or len(pool) < 10:
             continue
