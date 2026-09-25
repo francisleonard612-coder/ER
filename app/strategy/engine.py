@@ -56,6 +56,7 @@ async def run_scan_cycle(
     stake_multiplier: float,
     extra_edge_requirement: float,
     logger,
+    consecutive_losses: int = 0,
 ) -> ScanOutcome:
     if len(closes) < 70:
         logger.info(f"{symbol}: warming up, insufficient history ({len(closes)} candles)")
@@ -87,7 +88,8 @@ async def run_scan_cycle(
 
     for cand in top:
         calibrated = calibration.calibrate(cand.mc.probability)
-        stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier)
+        stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier,
+                                   consecutive_losses=consecutive_losses)
 
         # Deriv rejects EXPIRYRANGE barrier offsets past a symbol-specific
         # decimal limit (ContractBuyValidationError) -- confirmed different
