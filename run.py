@@ -153,6 +153,10 @@ class Bot:
         if sum(self.open_contracts_by_symbol.values()) >= self.cfg.max_concurrent_contracts:
             return
 
+        # queried once and reused below for both martingale sizing and the
+        # caution check -- was two separate storage queries before
+        consecutive_losses = self.storage.consecutive_losses(symbol)
+
         self.sm.transition(State.SIMULATING, symbol)
         try:
             outcome = await run_scan_cycle(
@@ -161,6 +165,7 @@ class Bot:
                 stake_multiplier=self.sm.stake_multiplier(),
                 extra_edge_requirement=self.sm.extra_edge_requirement(),
                 logger=self.logger,
+                consecutive_losses=consecutive_losses,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{symbol}: scan cycle failed (non-fatal): {exc!r}")
@@ -178,10 +183,9 @@ class Bot:
             })
 
         # consecutive-loss caution (temporary, auto-recovering -- section 8/29)
-        losses = self.storage.consecutive_losses(symbol)
-        if losses >= self.cfg.consecutive_loss_caution_threshold and not self.sm.is_symbol_cautioned(symbol):
+        if consecutive_losses >= self.cfg.consecutive_loss_caution_threshold and not self.sm.is_symbol_cautioned(symbol):
             self.sm.enter_caution(
-                symbol, f"{losses} consecutive losses", self.cfg.caution_cooldown_seconds,
+                symbol, f"{consecutive_losses} consecutive losses", self.cfg.caution_cooldown_seconds,
                 edge_penalty=0.03, stake_multiplier=0.5,
             )
 
