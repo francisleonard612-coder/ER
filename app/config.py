@@ -27,8 +27,8 @@ def _env_list(name: str, default: List[str]) -> List[str]:
 class StakingConfig:
     mode: str = "fixed"
     minimum_stake: float = 0.35
-    initial_stake: float = 1.0
-    maximum_stake: float = 5.0
+    initial_stake: float = 0.35
+    maximum_stake: float = 1.0
 
 
 @dataclass
