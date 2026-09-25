@@ -71,7 +71,7 @@ class Config:
     min_payout_multiplier: float = float(os.getenv("MIN_PAYOUT_MULTIPLIER", "1.40"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
     min_ev: float = float(os.getenv("MIN_EV", "0.0"))
-    max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.055"))
+    max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.051"))
 
     durations_minutes: List[int] = field(default_factory=lambda: list(range(2, 11)))
     barrier_vol_multiples: List[float] = field(
@@ -80,7 +80,7 @@ class Config:
 
     # --- risk ---
     max_concurrent_contracts: int = int(os.getenv("MAX_CONCURRENT_CONTRACTS", "3"))
-    max_concurrent_per_symbol: int = 1
+    max_concurrent_per_symbol: int = 2
     max_daily_exposure: float = float(os.getenv("MAX_DAILY_EXPOSURE", "50.0"))
     caution_cooldown_seconds: int = int(os.getenv("CAUTION_COOLDOWN_SECONDS", "120"))
     consecutive_loss_caution_threshold: int = int(os.getenv("CONSECUTIVE_LOSS_CAUTION_THRESHOLD", "4"))
