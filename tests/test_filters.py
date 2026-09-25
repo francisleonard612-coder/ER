@@ -42,6 +42,38 @@ def test_accepts_strong_edge_and_payout():
     assert d.accept
 
 
+def test_rejects_high_model_disagreement():
+    d = evaluate(
+        calibrated_probability=0.85, probability_uncertainty=0.01, payout=0.49, stake=0.35,
+        min_payout_multiplier=1.40, min_edge=0.05, min_ev=0.0, max_probability_uncertainty=0.06,
+        model_disagreement=0.10, max_model_disagreement=0.05,
+    )
+    assert not d.accept
+    assert "DISAGREEMENT" in d.reason
+
+
+def test_rejects_low_regime_confidence():
+    d = evaluate(
+        calibrated_probability=0.85, probability_uncertainty=0.01, payout=0.49, stake=0.35,
+        min_payout_multiplier=1.40, min_edge=0.05, min_ev=0.0, max_probability_uncertainty=0.06,
+        regime_confidence=0.3, min_regime_confidence=0.55,
+    )
+    assert not d.accept
+    assert "REGIME CONFIDENCE" in d.reason
+
+
+def test_edge_requirement_scales_with_duration():
+    kwargs = dict(
+        calibrated_probability=0.78, probability_uncertainty=0.01, payout=0.49, stake=0.35,
+        min_payout_multiplier=1.40, min_edge=0.05, min_ev=0.0, max_probability_uncertainty=0.06,
+        edge_duration_scaling=0.02,
+    )
+    short = evaluate(**kwargs, duration_minutes=0)
+    long = evaluate(**kwargs, duration_minutes=10)
+    assert short.accept
+    assert not long.accept  # same edge, but a 10-minute trade needs more margin than a baseline one
+
+
 def test_caution_penalty_raises_required_edge():
     kwargs = dict(
         calibrated_probability=0.78, probability_uncertainty=0.01, payout=0.49, stake=0.35,
