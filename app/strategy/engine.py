@@ -72,6 +72,9 @@ async def run_scan_cycle(
     candidates = build_candidates(
         current_price, pools, current_vol, list(pools.keys()), cfg.barrier_vol_multiples,
         TRADE_THRESHOLD_PROBABILITY, cfg.monte_carlo,
+        regime_name=regime.regime.value, regime_confidence=regime.confidence,
+        calm_regimes=tuple(cfg.calm_regimes), calm_regime_confidence_floor=cfg.calm_regime_confidence_floor,
+        non_calm_max_duration_minutes=cfg.non_calm_max_duration_minutes,
     )
     if not candidates:
         return ScanOutcome(symbol, False, None, [])
@@ -130,6 +133,12 @@ async def run_scan_cycle(
             min_ev=cfg.min_ev,
             max_probability_uncertainty=cfg.max_probability_uncertainty,
             extra_edge_requirement=extra_edge_requirement,
+            model_disagreement=cand.mc.model_disagreement,
+            max_model_disagreement=cfg.max_model_disagreement,
+            regime_confidence=regime.confidence,
+            min_regime_confidence=cfg.min_regime_confidence_to_trade,
+            duration_minutes=cand.duration_minutes,
+            edge_duration_scaling=cfg.edge_duration_scaling,
         )
 
         row = {
