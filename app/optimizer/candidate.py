@@ -79,7 +79,22 @@ def build_candidates(
             barrier_vol = current_volatility
 
         for mult in vol_multiples:
-            distance = mult * barrier_vol * current_price
+            # sqrt(duration) scaling: real price dispersion over N minutes
+            # grows roughly with sqrt(N) for a random-walk-like process --
+            # which is exactly what our own Monte Carlo engine produces,
+            # since it sums N per-minute return draws. Without this, barrier
+            # width was sized purely off a per-MINUTE volatility with no
+            # regard for how many minutes the contract actually runs, so a
+            # fixed width applied to a short 2-3 minute contract came out
+            # enormously wide relative to real short-horizon dispersion --
+            # a near-guaranteed win, which is exactly what Deriv's
+            # "This contract offers no return" rejection means. That
+            # rejection went from an occasional, expected edge case to
+            # consuming ~99% of proposal requests in production once the
+            # volatility estimate itself was fixed to be accurate (see
+            # run.py/candidate.py history) -- an accurate per-minute vol
+            # made the missing duration scaling far more visible, not less.
+            distance = mult * barrier_vol * np.sqrt(duration) * current_price
             if distance <= 0:
                 continue
 
@@ -105,7 +120,18 @@ def build_candidates(
                 False, duration, current_volatility, trade_threshold_probability, mc_config,
             ))
 
-    candidates.sort(key=lambda c: c.mc.probability, reverse=True)
+    # SORT BY CLOSENESS TO A PRICING SWEET SPOT, NOT RAW PROBABILITY
+    # DESCENDING. Sorting purely by descending probability always prefers
+    # the widest, most "boringly certain" candidates across every duration --
+    # exactly the ones Deriv refuses to price at all ("no return"), since a
+    # near-guaranteed outcome has no payout worth quoting. What actually
+    # matters is candidates sitting comfortably above the ~1/1.40 = 0.714
+    # break-even implied by the payout floor, with enough margin for a real
+    # edge but not so much margin that the contract is worthless to price.
+    # 0.80 is that target -- moderately above break-even, still far from the
+    # near-certain range where payouts vanish.
+    PRICING_SWEET_SPOT = 0.80
+    candidates.sort(key=lambda c: abs(c.mc.probability - PRICING_SWEET_SPOT))
     return candidates
 
 
