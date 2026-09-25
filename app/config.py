@@ -28,7 +28,7 @@ class StakingConfig:
     mode: str = "fixed"
     minimum_stake: float = 0.35
     initial_stake: float = 0.35
-    maximum_stake: float = 1.0
+    maximum_stake: float = 0.35
 
 
 @dataclass
@@ -63,7 +63,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: _env_list(
             "SYMBOLS",
-            ["R_10"],
+            ["R_10", "R_25", "R_50", "R_75", "R_100"],
         )
     )
 
@@ -71,7 +71,28 @@ class Config:
     min_payout_multiplier: float = float(os.getenv("MIN_PAYOUT_MULTIPLIER", "1.40"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
     min_ev: float = float(os.getenv("MIN_EV", "0.0"))
-    max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.051"))
+    max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.06"))
+
+    # --- certainty gating (replaces time-based pacing entirely -- a trade
+    # opens whenever it clears these bars, however soon after the last one,
+    # and stays closed however long it takes otherwise) ---
+    max_model_disagreement: float = float(os.getenv("MAX_MODEL_DISAGREEMENT", "0.05"))
+    min_regime_confidence_to_trade: float = float(os.getenv("MIN_REGIME_CONFIDENCE_TO_TRADE", "0.55"))
+    # extra required edge per minute of contract duration, on top of min_edge
+    # -- a 2-minute trade needs only min_edge; a 10-minute trade needs
+    # min_edge + edge_duration_scaling * 10, since our own probability
+    # estimate is inherently noisier the further out it's simulating.
+    edge_duration_scaling: float = float(os.getenv("EDGE_DURATION_SCALING", "0.01"))
+
+    # --- duration ceiling tied to regime: the full duration grid is only
+    # offered when the regime is calm AND regime confidence clears the
+    # floor below; otherwise duration is capped to non_calm_max_duration_
+    # minutes. See app/optimizer/candidate.py. ---
+    calm_regimes: List[str] = field(
+        default_factory=lambda: _env_list("CALM_REGIMES", ["LOW_VOLATILITY_RANGE", "VOLATILITY_CONTRACTION"])
+    )
+    calm_regime_confidence_floor: float = float(os.getenv("CALM_REGIME_CONFIDENCE_FLOOR", "0.6"))
+    non_calm_max_duration_minutes: int = int(os.getenv("NON_CALM_MAX_DURATION_MINUTES", "4"))
 
     durations_minutes: List[int] = field(default_factory=lambda: list(range(2, 11)))
     barrier_vol_multiples: List[float] = field(
@@ -80,7 +101,7 @@ class Config:
 
     # --- risk ---
     max_concurrent_contracts: int = int(os.getenv("MAX_CONCURRENT_CONTRACTS", "3"))
-    max_concurrent_per_symbol: int = 2
+    max_concurrent_per_symbol: int = 1
     max_daily_exposure: float = float(os.getenv("MAX_DAILY_EXPOSURE", "50.0"))
     caution_cooldown_seconds: int = int(os.getenv("CAUTION_COOLDOWN_SECONDS", "120"))
     consecutive_loss_caution_threshold: int = int(os.getenv("CONSECUTIVE_LOSS_CAUTION_THRESHOLD", "4"))
