@@ -30,7 +30,7 @@ class StakingConfig:
     # explicit env var, martingale included.
     mode: str = field(default_factory=lambda: os.getenv("STAKING_MODE", "fixed"))
     minimum_stake: float = float(os.getenv("STAKING_MINIMUM_STAKE", "0.35"))
-    initial_stake: float = float(os.getenv("STAKING_INITIAL_STAKE", "1.0"))
+    initial_stake: float = float(os.getenv("STAKING_INITIAL_STAKE", "0.35"))
     # NOTE: this is a hard ceiling applied AFTER any martingale escalation.
     # Left at the old 0.35 default, martingale mode would compute an
     # escalated stake and then have it clamped straight back down to
@@ -39,10 +39,10 @@ class StakingConfig:
     # (top rung = 0.35 * 2.5**4 = 13.67), but this is exactly the number to
     # actively re-check if you change the base stake, factor, or steps --
     # it will not automatically track those.
-    maximum_stake: float = float(os.getenv("STAKING_MAXIMUM_STAKE", "15.0"))
+    maximum_stake: float = float(os.getenv("STAKING_MAXIMUM_STAKE", "1.0"))
     # martingale mode only (app/strategy/staking.py:MartingaleStaking)
-    martingale_factor: float = float(os.getenv("MARTINGALE_FACTOR", "2.5"))
-    martingale_steps: int = int(os.getenv("MARTINGALE_STEPS", "4"))
+    martingale_factor: float = float(os.getenv("MARTINGALE_FACTOR", "1.2"))
+    martingale_steps: int = int(os.getenv("MARTINGALE_STEPS", "3"))
 
 
 @dataclass
@@ -77,7 +77,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: _env_list(
             "SYMBOLS",
-            ["R_10", "1HZ10V", "RDBULL", "RDBEAR"],
+            ["R_10", "RDBULL", "RDBEAR"],
         )
     )
 
