@@ -30,7 +30,7 @@ class StakingConfig:
     # explicit env var, martingale included.
     mode: str = field(default_factory=lambda: os.getenv("STAKING_MODE", "fixed"))
     minimum_stake: float = float(os.getenv("STAKING_MINIMUM_STAKE", "0.35"))
-    initial_stake: float = float(os.getenv("STAKING_INITIAL_STAKE", "0.35"))
+    initial_stake: float = float(os.getenv("STAKING_INITIAL_STAKE", "1.0"))
     # NOTE: this is a hard ceiling applied AFTER any martingale escalation.
     # Left at the old 0.35 default, martingale mode would compute an
     # escalated stake and then have it clamped straight back down to
@@ -77,7 +77,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: _env_list(
             "SYMBOLS",
-            ["R_10", "RDBULL", "RDBEAR"],
+            ["R_10", "1HZ10V", "RDBULL", "RDBEAR"],
         )
     )
 
