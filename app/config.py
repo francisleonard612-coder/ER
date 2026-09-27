@@ -39,9 +39,9 @@ class StakingConfig:
     # (top rung = 0.35 * 2.5**4 = 13.67), but this is exactly the number to
     # actively re-check if you change the base stake, factor, or steps --
     # it will not automatically track those.
-    maximum_stake: float = float(os.getenv("STAKING_MAXIMUM_STAKE", "1.0"))
+    maximum_stake: float = float(os.getenv("STAKING_MAXIMUM_STAKE", "4.0"))
     # martingale mode only (app/strategy/staking.py:MartingaleStaking)
-    martingale_factor: float = float(os.getenv("MARTINGALE_FACTOR", "1.2"))
+    martingale_factor: float = float(os.getenv("MARTINGALE_FACTOR", "3.1"))
     martingale_steps: int = int(os.getenv("MARTINGALE_STEPS", "3"))
 
 
@@ -77,7 +77,7 @@ class Config:
     symbols: List[str] = field(
         default_factory=lambda: _env_list(
             "SYMBOLS",
-            ["R_10", "RDBULL", "RDBEAR"],
+            ["RDBULL", "RDBEAR"],
         )
     )
 
