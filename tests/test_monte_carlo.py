@@ -38,3 +38,37 @@ def test_adaptive_path_count_scales_with_distance_to_threshold():
     far = adaptive_path_count(0.20, 0.71, minimum=1000, default=5000, maximum=20000, band=0.03)
     assert near >= far
     assert far == 1000
+
+
+def test_matches_analytic_normal_random_walk():
+    # For i.i.d. normal log-returns the in-range probability has a closed form;
+    # the vectorized simulator must reproduce it.
+    from math import erf, log, sqrt
+    rng = np.random.default_rng(3)
+    returns = rng.normal(0, 0.001, size=5000)
+    sd = float(np.std(returns, ddof=1)) * sqrt(4)
+    res = estimate_probability_in_range(100.0, returns, 4, 99.8, 100.2, float(np.std(returns, ddof=1)),
+                                        n_paths=40000, seed=7)
+    expected = 0.5 * (erf(log(100.2 / 100) / sd / sqrt(2)) - erf(log(99.8 / 100) / sd / sqrt(2)))
+    assert abs(res.probability - expected) < 0.01
+    assert res.probability_uncertainty < 0.005
+
+
+def test_block_bootstrap_uses_contiguous_blocks():
+    from app.models.monte_carlo import _simulate_paths
+    # a strictly increasing pool: contiguous-block sampling of 3 steps from
+    # block_size 3 must produce sums of 3 consecutive pool entries only
+    pool = np.arange(10, dtype=float) * 1e-3
+    finals = _simulate_paths(1.0, pool, steps=3, n_paths=500, block_size=3, rng=np.random.default_rng(0))
+    sums = np.round(np.log(finals) * 1e3).astype(int)
+    valid = {3 * i + 3 for i in range(8)}  # i + (i+1) + (i+2)
+    assert set(sums) <= valid
+
+
+def test_fast_enough_not_to_block_event_loop():
+    import time
+    rng = np.random.default_rng(0)
+    returns = rng.normal(0, 0.001, size=300)
+    t = time.perf_counter()
+    estimate_probability_in_range(100.0, returns, 10, 99.7, 100.3, 0.001, n_paths=100_000, seed=1)
+    assert time.perf_counter() - t < 1.0

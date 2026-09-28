@@ -55,7 +55,8 @@ python run.py
    - `SHADOW_MODE=true` (keep true until you trust the shadow-mode logs)
 5. Deploy. `railway.toml` sets the start command and a health check against
    the root path, which the bot serves via a lightweight built-in HTTP server
-   on `$PORT`.
+   on `$PORT`. `/` returns 503 if no Deriv traffic has arrived for 2 minutes;
+   `/stats` returns a JSON scorecard (see "Reading the scorecard" below).
 
 ## Demo mode vs shadow mode — these are two independent switches
 
@@ -71,6 +72,51 @@ authorizes against (demo vs. real balance); `SHADOW_MODE` is what actually
 gates whether `buy_contract` is called. Recommended path: DEMO+shadow=true
 first, then DEMO+shadow=false to watch it trade for real against virtual
 money, then LIVE only once you're comfortable.
+
+## Reading the scorecard (`/stats`)
+
+Shadow trades are now resolved against the real exit tick at expiry, so
+shadow mode produces an actual track record instead of an ever-growing pile
+of OPEN rows. `/stats` (and a `PERFORMANCE[...]` log line every 15 minutes)
+reports, separately for shadow and executed trades:
+
+- `win_rate` vs `avg_predicted` -- **the key number.** If the model is
+  honest these track each other. If `win_rate` sits well below
+  `avg_predicted` over a few hundred trades, the model is overstating its
+  edge and should not go live.
+- `avg_implied` -- what Deriv's pricing implied. A real edge means
+  `win_rate` beats this, not just `avg_predicted`.
+- `pnl`, `roi`, `open`, plus today's stake vs `MAX_DAILY_EXPOSURE`.
+
+Shadow trades occupy position slots until resolved, exactly as live trades
+do, so the shadow record reflects what live mode would actually have done.
+
+## Changelog -- v2 hardening
+
+- **Calibration was learning under the wrong key.** Outcomes were recorded
+  by *calibrated* probability but looked up by *raw* probability, so the
+  calibration layer never applied what it learned. Fixed; existing bucket
+  data was written under mismatched keys -- consider clearing the
+  `calibration_buckets` table once so it relearns cleanly.
+- **Monte Carlo vectorized** (~10-50x faster) and run in a worker thread. A
+  scan used to block the event loop for tens of seconds per symbol, long
+  enough to starve the WebSocket and trip the ping timeout.
+- **Settlement is idempotent** -- a repeated final contract update can no
+  longer double-count an outcome. Settled contract streams are now dropped
+  instead of being re-subscribed after every reconnect forever.
+- **Restart-safe positions.** Contracts open at restart are re-attached,
+  settled, and count toward concurrency limits.
+- **Ambiguous buys reconciled** via `portfolio` (never retried).
+- **`MAX_DAILY_EXPOSURE` is now enforced** (it was defined but unused);
+  resets at 00:00 UTC.
+- **Consecutive-loss / martingale counts are per mode**, so a shadow losing
+  streak doesn't size your first real stakes.
+- Trades record the barriers Deriv actually quoted (rounded offsets applied
+  to Deriv's spot), removed a pre-buy `balance` round-trip that aged the
+  proposal, and added an additive schema migration so new columns reach an
+  existing Railway Postgres database automatically.
+- Test suite: 40 tests (was 25), including end-to-end settlement, restart,
+  shadow resolution and ambiguous-buy checks against a fake Deriv client.
 
 ## Scope of this build — what's here and what isn't
 
@@ -101,10 +147,7 @@ version of all of it:
 - **Test suite covers the core math** (Monte Carlo bounds, edge/EV/payout
   logic, calibration shrinkage, staking) rather than every item in the
   spec's 40+ point checklist (e.g. no live-WebSocket integration test against
-  a real Deriv sandbox, no Railway-restart integration test). I ran what I
-  could in this sandbox — 13 tests pass offline; `test_calibration.py`
-  needs SQLAlchemy installed to run (`pip install -r requirements.txt`
-  first).
+  a real Deriv sandbox). Run with `pip install -r requirements.txt && pytest`.
 - **No walk-forward backtest report** is generated yet for the same reason
   as the data point above.
 

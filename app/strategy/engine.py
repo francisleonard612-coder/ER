@@ -5,6 +5,7 @@ only, (if live) return the winning candidate for execution.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -70,7 +71,11 @@ async def run_scan_cycle(
     if not pools:
         return ScanOutcome(symbol, False, None, [])
 
-    candidates = build_candidates(
+    # CPU-bound (dozens to hundreds of Monte Carlo runs) -- run it in a worker
+    # thread so the WebSocket pump, pings and settlement callbacks keep being
+    # serviced while we simulate.
+    candidates = await asyncio.to_thread(
+        build_candidates,
         current_price, pools, current_vol, list(pools.keys()), cfg.barrier_vol_multiples,
         TRADE_THRESHOLD_PROBABILITY, cfg.monte_carlo,
         regime_name=regime.regime.value, regime_confidence=regime.confidence,
@@ -86,8 +91,11 @@ async def run_scan_cycle(
     best_accept = None
     best_row = None
 
+    # one DB read per scan instead of one per candidate
+    calibration_buckets = calibration.snapshot()
+
     for cand in top:
-        calibrated = calibration.calibrate(cand.mc.probability)
+        calibrated = calibration.calibrate(cand.mc.probability, buckets=calibration_buckets)
         stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier,
                                    consecutive_losses=consecutive_losses)
 
@@ -125,6 +133,17 @@ async def run_scan_cycle(
         if payout <= 0 or not proposal_id:
             continue
 
+        # Record the barriers Deriv was actually quoted -- the rounded
+        # offsets applied to Deriv's own reference spot -- not the unrounded
+        # candidate levels. These are what a shadow trade is later settled
+        # against, so they must match what the contract would really be.
+        try:
+            entry_spot = float(proposal.get("spot") or current_price)
+        except (TypeError, ValueError):
+            entry_spot = current_price
+        quoted_lower = entry_spot + lower_offset
+        quoted_upper = entry_spot + upper_offset
+
         decision = evaluate(
             calibrated_probability=calibrated,
             probability_uncertainty=cand.mc.probability_uncertainty,
@@ -146,10 +165,10 @@ async def run_scan_cycle(
         row = {
             "trade_id": str(uuid.uuid4()),
             "symbol": symbol,
-            "entry_price": current_price,
+            "entry_price": entry_spot,
             "duration_minutes": cand.duration_minutes,
-            "lower_barrier": cand.lower_barrier,
-            "upper_barrier": cand.upper_barrier,
+            "lower_barrier": quoted_lower,
+            "upper_barrier": quoted_upper,
             "stake": stake,
             "proposal_id": proposal_id,
             "payout": payout,
@@ -165,7 +184,7 @@ async def run_scan_cycle(
             "model_disagreement": cand.mc.model_disagreement,
             "mc_path_count": cand.mc.path_count,
             "decision_score": decision.expected_value,
-            "model_version": "v1",
+            "model_version": "v2",
         }
 
         logger.info(

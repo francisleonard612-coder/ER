@@ -31,14 +31,11 @@ class StakingConfig:
     mode: str = field(default_factory=lambda: os.getenv("STAKING_MODE", "fixed"))
     minimum_stake: float = float(os.getenv("STAKING_MINIMUM_STAKE", "0.35"))
     initial_stake: float = float(os.getenv("STAKING_INITIAL_STAKE", "0.35"))
-    # NOTE: this is a hard ceiling applied AFTER any martingale escalation.
-    # Left at the old 0.35 default, martingale mode would compute an
-    # escalated stake and then have it clamped straight back down to
-    # nothing -- the feature would silently do nothing. Raised here to
-    # comfortably clear a factor=2.5, steps=4 ladder off a 0.35 base
-    # (top rung = 0.35 * 2.5**4 = 13.67), but this is exactly the number to
-    # actively re-check if you change the base stake, factor, or steps --
-    # it will not automatically track those.
+    # NOTE: hard ceiling applied AFTER any martingale escalation. With the
+    # current defaults (0.35 base, factor 3.1, 3 steps) the ladder is
+    # 0.35 -> 1.085 -> 3.36 -> 10.42, so the top rung is clamped to 4.00:
+    # step 3 is effectively capped. Re-check this whenever you change the
+    # base stake, factor or steps -- it does not track them automatically.
     maximum_stake: float = float(os.getenv("STAKING_MAXIMUM_STAKE", "4.0"))
     # martingale mode only (app/strategy/staking.py:MartingaleStaking)
     martingale_factor: float = float(os.getenv("MARTINGALE_FACTOR", "3.1"))

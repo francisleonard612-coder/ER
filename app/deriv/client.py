@@ -564,6 +564,34 @@ class DerivClient:
                 self.logger.error(f"Deriv: initial contract callback failed (non-fatal): {exc!r}")
         return key
 
+    async def forget_subscription(self, key: str) -> None:
+        """Stops tracking a subscription locally and asks Deriv to end the
+        stream. Removing it locally is what matters: every entry left in
+        _subscriptions is re-sent by _reconnect(), so settled contracts that
+        were never removed piled up and got resubscribed after every
+        reconnect for the life of the process."""
+        sub = self._subscriptions.pop(key, None)
+        if key.startswith("contract:"):
+            self._contract_queues.pop(key.split(":", 1)[1], None)
+        if sub and sub.subscription_id:
+            try:
+                await self.send({"forget": sub.subscription_id}, timeout=5.0)
+            except Exception as exc:  # noqa: BLE001 - stream may already be closed server-side
+                self.logger.debug(f"Deriv: forget {key} ignored ({exc!r})")
+
+    async def get_spot_at(self, symbol: str, epoch: int) -> tuple[float, int] | None:
+        """The last tick at or before `epoch` -> (price, tick_epoch), or None.
+        Used to resolve shadow trades against the real market, the same way
+        Deriv takes the exit spot at expiry."""
+        resp = await self.send({
+            "ticks_history": symbol, "style": "ticks", "end": int(epoch), "count": 1,
+        })
+        hist = resp.get("history") or {}
+        prices, times = hist.get("prices") or [], hist.get("times") or []
+        if not prices or not times:
+            return None
+        return float(prices[-1]), int(times[-1])
+
     async def balance(self) -> dict:
         resp = await self.send({"balance": 1})
         return resp.get("balance", {})

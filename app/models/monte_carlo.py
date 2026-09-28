@@ -33,26 +33,25 @@ class MCResult:
 
 def _simulate_paths(current_price: float, returns_pool: np.ndarray, steps: int,
                      n_paths: int, block_size: int, rng: np.random.Generator) -> np.ndarray:
-    """Block bootstrap path simulation. block_size=1 reduces to i.i.d. bootstrap."""
-    if len(returns_pool) < block_size:
-        block_size = max(1, len(returns_pool))
+    """Block bootstrap path simulation, fully vectorized. block_size=1
+    reduces to i.i.d. bootstrap. Returns final prices only.
+
+    Previously this looped in Python once per path (and again per block),
+    which cost ~0.2s per 10k paths and ~2.6s per 100k -- multiplied across
+    the 81-243 candidates a single scan scores, that blocked the asyncio
+    event loop for tens of seconds per symbol, long enough to starve the
+    WebSocket pump and trip the 60s ping timeout. Same sampling scheme,
+    now one numpy gather + sum.
+    """
+    returns_pool = np.asarray(returns_pool, dtype=float)
+    n = len(returns_pool)
+    block_size = max(1, min(block_size, n))
     n_blocks = int(np.ceil(steps / block_size))
 
-    paths = np.empty((n_paths, steps))
-    for p in range(n_paths):
-        chunks = []
-        remaining = steps
-        while remaining > 0:
-            start = rng.integers(0, len(returns_pool) - block_size + 1) if len(returns_pool) > block_size else 0
-            take = min(block_size, remaining)
-            chunks.append(returns_pool[start:start + take])
-            remaining -= take
-        path_returns = np.concatenate(chunks)[:steps]
-        paths[p] = np.cumsum(path_returns)
-
-    final_log_moves = paths[:, -1]
-    final_prices = current_price * np.exp(final_log_moves)
-    return final_prices
+    starts = rng.integers(0, n - block_size + 1, size=(n_paths, n_blocks))
+    idx = (starts[:, :, None] + np.arange(block_size)).reshape(n_paths, n_blocks * block_size)[:, :steps]
+    final_log_moves = returns_pool[idx].sum(axis=1)
+    return current_price * np.exp(final_log_moves)
 
 
 def estimate_probability_in_range(
@@ -94,12 +93,12 @@ def estimate_probability_in_range(
     all_finals = np.concatenate([empirical_final, block_final])
     p_ensemble = in_range_prob(all_finals)
 
-    # bootstrap-of-the-bootstrap uncertainty: resample the pooled outcomes
-    resample_probs = []
-    for _ in range(30):
-        idx = rng.integers(0, len(all_finals), size=len(all_finals))
-        resample_probs.append(in_range_prob(all_finals[idx]))
-    uncertainty = float(np.std(resample_probs))
+    # Monte Carlo standard error of the pooled estimate. This is the exact
+    # quantity the old 30x "bootstrap-of-the-bootstrap" resampling loop was
+    # approximating (the std of a resampled Bernoulli mean), without the
+    # extra 30 passes over every path.
+    n_total = len(all_finals)
+    uncertainty = float(np.sqrt(max(p_ensemble * (1.0 - p_ensemble), 0.0) / n_total)) if n_total else 0.5
 
     disagreement = abs(p_empirical - p_block)
 

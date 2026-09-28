@@ -1,7 +1,7 @@
 """
 Modular staking. Ships with fixed staking at the mandated 0.35 default,
-plus an opt-in martingale mode (factor 2.5, 4 steps off a 0.35 base by
-default -- see StakingConfig in app/config.py for the exact env vars).
+plus an opt-in martingale mode (see StakingConfig in app/config.py for the
+current factor/steps defaults and env vars).
 The interface (stake_for) is deliberately narrow so further strategies
 can be added without touching the decision engine.
 """
