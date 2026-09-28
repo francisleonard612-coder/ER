@@ -114,11 +114,22 @@ def detect_regime(prices: np.ndarray, short_window: int = 20, long_window: int =
 
     vol_ratio = short_vol / long_vol if long_vol > 0 else 1.0
 
-    # trend check first -- strong directional momentum dominates
-    if mom > 1.5 * long_vol and mom > 0:
-        return RegimeAssessment(Regime.TRENDING_UP, min(0.9, 0.5 + abs(mom)), short_vol, mom, ac)
-    if mom < -1.5 * long_vol and mom < 0:
-        return RegimeAssessment(Regime.TRENDING_DOWN, min(0.9, 0.5 + abs(mom)), short_vol, mom, ac)
+    # trend check first -- strong directional momentum dominates.
+    #
+    # SCALE FIX: `mom` is a short_window-bar move, `long_vol` a 1-bar
+    # volatility. Comparing them directly (the old `mom > 1.5 * long_vol`)
+    # meant a pure random walk -- whose 20-bar move is typically
+    # long_vol * sqrt(20) ~ 4.5x a 1-bar move -- read as "trending" ~74% of
+    # the time. And confidence was `0.5 + abs(mom)`, adding a raw fractional
+    # return (~0.001) to 0.5, which pinned every trend at 0.50-0.52 and
+    # below the 0.55 trading gate regardless of how strong it was. Both now
+    # use the move measured in its own standard deviations.
+    trend_z = mom / (long_vol * np.sqrt(short_window)) if long_vol > 0 else 0.0
+    trend_conf = min(0.9, 0.5 + 0.15 * (abs(trend_z) - 1.5))
+    if trend_z > 1.5:
+        return RegimeAssessment(Regime.TRENDING_UP, trend_conf, short_vol, mom, ac)
+    if trend_z < -1.5:
+        return RegimeAssessment(Regime.TRENDING_DOWN, trend_conf, short_vol, mom, ac)
 
     if ac < -0.15:
         return RegimeAssessment(Regime.MEAN_REVERTING, min(0.85, 0.5 + abs(ac)), short_vol, mom, ac)
