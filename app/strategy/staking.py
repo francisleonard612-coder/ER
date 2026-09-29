@@ -7,7 +7,19 @@ can be added without touching the decision engine.
 """
 from __future__ import annotations
 
+from decimal import ROUND_DOWN, Decimal
+
 from app.config import StakingConfig
+
+
+def to_cents(stake: float, minimum: float = 0.0) -> float:
+    """Deriv rejects any stake with more than 2 decimal places
+    (ContractBuyValidationError). Martingale escalation and the caution
+    halving produce values like 0.39375, so every stake is rounded DOWN to
+    whole cents (never above the computed/max stake), then kept >= minimum."""
+    cents = float(Decimal(str(stake)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+    floor = float(Decimal(str(minimum)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)) if minimum else 0.0
+    return max(cents, floor)
 
 
 class FixedStaking:
@@ -17,7 +29,8 @@ class FixedStaking:
     def stake_for(self, edge: float, decision_score: float, stake_multiplier: float = 1.0,
                    consecutive_losses: int = 0) -> float:
         stake = self.cfg.initial_stake * stake_multiplier
-        return max(self.cfg.minimum_stake, min(stake, self.cfg.maximum_stake))
+        return to_cents(max(self.cfg.minimum_stake, min(stake, self.cfg.maximum_stake)),
+                        self.cfg.minimum_stake)
 
 
 class MartingaleStaking:
@@ -56,7 +69,8 @@ class MartingaleStaking:
                    consecutive_losses: int = 0) -> float:
         step = min(max(consecutive_losses, 0), self.cfg.martingale_steps)
         stake = self.cfg.initial_stake * (self.cfg.martingale_factor ** step) * stake_multiplier
-        return max(self.cfg.minimum_stake, min(stake, self.cfg.maximum_stake))
+        return to_cents(max(self.cfg.minimum_stake, min(stake, self.cfg.maximum_stake)),
+                        self.cfg.minimum_stake)
 
 
 def build_staking_engine(cfg: StakingConfig):

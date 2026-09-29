@@ -517,7 +517,7 @@ class DerivClient:
         earlier version of this method did.
         """
         resp = await self.send({
-            "proposal": 1, "amount": stake, "basis": "stake",
+            "proposal": 1, "amount": round(float(stake), 2), "basis": "stake",
             "contract_type": "EXPIRYRANGE", "currency": currency,
             "duration": duration_minutes, "duration_unit": "m",
             "underlying_symbol": symbol,

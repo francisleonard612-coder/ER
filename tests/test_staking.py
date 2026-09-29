@@ -19,12 +19,13 @@ def test_martingale_escalates_with_consecutive_losses():
                          maximum_stake=15.0, martingale_factor=2.5, martingale_steps=4)
     engine = build_staking_engine(cfg)
     stakes = [engine.stake_for(edge=0.1, decision_score=0.8, consecutive_losses=n) for n in range(6)]
-    # 0.35, 0.875, 2.1875, 5.46875, 13.671875, then capped (not escalating further)
+    # raw 0.35, 0.875, 2.1875, 5.46875, 13.671875 -- rounded DOWN to whole
+    # cents because Deriv rejects stakes with more than 2 decimal places
     assert stakes[0] == 0.35
-    assert abs(stakes[1] - 0.875) < 1e-9
-    assert abs(stakes[2] - 2.1875) < 1e-9
-    assert abs(stakes[3] - 5.46875) < 1e-9
-    assert abs(stakes[4] - 13.671875) < 1e-9
+    assert stakes[1] == 0.87
+    assert stakes[2] == 2.18
+    assert stakes[3] == 5.46
+    assert stakes[4] == 13.67
     assert stakes[5] == stakes[4]  # holds at the step-4 ceiling, does not escalate to step 5
 
 
