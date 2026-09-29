@@ -83,3 +83,20 @@ def test_caution_penalty_raises_required_edge():
     cautious = evaluate(**kwargs, extra_edge_requirement=0.10)
     assert normal.accept
     assert not cautious.accept
+
+
+def test_random_walk_is_not_mostly_trending_and_trend_confidence_scales():
+    import numpy as np
+    from app.features.stats import Regime, detect_regime
+    rng = np.random.default_rng(0)
+    labels = []
+    for _ in range(400):
+        prices = 1000 * np.exp(np.cumsum(rng.normal(0, 0.001, 120)))
+        labels.append(detect_regime(prices).regime)
+    trending = sum(r in (Regime.TRENDING_UP, Regime.TRENDING_DOWN) for r in labels) / len(labels)
+    assert trending < 0.25          # was ~0.74 before the scale fix
+
+    rets = rng.normal(0, 0.001, 119)
+    rets[-20:] += 0.0015            # strong 20-bar drift
+    strong = detect_regime(1000 * np.exp(np.concatenate([[0], np.cumsum(rets)])))
+    assert strong.regime == Regime.TRENDING_UP and strong.confidence > 0.6
