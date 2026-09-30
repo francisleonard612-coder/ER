@@ -85,6 +85,8 @@ def evaluate(
 
     required_edge = min_edge + extra_edge_requirement + edge_duration_scaling * duration_minutes
 
+    if pm <= 1.0:
+        return Decision(False, "PAYOUT DOES NOT EXCEED STAKE", payout, pm, implied, edge, ev)
     if pm < min_payout_multiplier:
         return Decision(False, f"PAYOUT BELOW {min_payout_multiplier:.2f}", payout, pm, implied, edge, ev)
     if probability_uncertainty > max_probability_uncertainty:
