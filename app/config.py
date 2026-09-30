@@ -79,7 +79,11 @@ class Config:
     )
 
     # --- strategy thresholds ---
-    min_payout_multiplier: float = float(os.getenv("MIN_PAYOUT_MULTIPLIER", "1.40"))
+    # 1.0 = no payout floor: any payout above the stake is allowed, and the
+    # edge/EV checks alone decide (a low payout needs a correspondingly
+    # higher calibrated probability to clear min_edge). Set the env var to
+    # re-impose a floor.
+    min_payout_multiplier: float = float(os.getenv("MIN_PAYOUT_MULTIPLIER", "1.0"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
     min_ev: float = float(os.getenv("MIN_EV", "0.0"))
     max_probability_uncertainty: float = float(os.getenv("MAX_PROB_UNCERTAINTY", "0.06"))

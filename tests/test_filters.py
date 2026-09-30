@@ -100,3 +100,22 @@ def test_random_walk_is_not_mostly_trending_and_trend_confidence_scales():
     rets[-20:] += 0.0015            # strong 20-bar drift
     strong = detect_regime(1000 * np.exp(np.concatenate([[0], np.cumsum(rets)])))
     assert strong.regime == Regime.TRENDING_UP and strong.confidence > 0.6
+
+
+def test_no_payout_floor_low_payout_judged_by_edge_alone():
+    import os
+    if "MIN_PAYOUT_MULTIPLIER" not in os.environ:
+        from app.config import Config
+        assert Config().min_payout_multiplier == 1.0
+    # payout 1.20x -> implied 83.3%; 90% calibrated clears a 5% edge -> accepted
+    d = evaluate(calibrated_probability=0.90, probability_uncertainty=0.01, payout=0.42, stake=0.35,
+                 min_payout_multiplier=1.0, min_edge=0.05, min_ev=0.0, max_probability_uncertainty=0.06)
+    assert d.accept, d.reason
+    # same payout, 86% calibrated -> edge too small -> rejected on edge, not payout
+    d = evaluate(calibrated_probability=0.86, probability_uncertainty=0.01, payout=0.42, stake=0.35,
+                 min_payout_multiplier=1.0, min_edge=0.05, min_ev=0.0, max_probability_uncertainty=0.06)
+    assert not d.accept and d.reason == "INSUFFICIENT EDGE"
+    # payout not above stake is never accepted
+    d = evaluate(calibrated_probability=0.999, probability_uncertainty=0.0, payout=0.35, stake=0.35,
+                 min_payout_multiplier=1.0, min_edge=0.0, min_ev=-1.0, max_probability_uncertainty=0.06)
+    assert not d.accept and d.reason == "PAYOUT DOES NOT EXCEED STAKE"
