@@ -271,7 +271,8 @@ class Bot:
             buy_resp = await self.client.buy_contract(row["proposal_id"], row["stake"])
         except BuyAmbiguousError as exc:
             self.logger.error(f"{symbol}: {exc} -- reconciling against portfolio")
-            buy_resp = await self._reconcile_ambiguous_buy(symbol, since=buy_started - 5)
+            buy_resp = await self._reconcile_ambiguous_buy(symbol, since=buy_started - 5,
+                                                         stake=row["stake"], payout=row["payout"])
             if buy_resp is None:
                 self.sm.enter_caution(symbol, "ambiguous buy, no contract found", self.cfg.caution_cooldown_seconds)
                 return
@@ -330,9 +331,14 @@ class Bot:
         self.logger.info(f"{symbol} SETTLED ({source}): {result} pnl={profit:+.4f}"
                          + (f" exit={exit_spot}" if exit_spot is not None else ""))
 
-    async def _reconcile_ambiguous_buy(self, symbol: str, since: float) -> dict | None:
+    async def _reconcile_ambiguous_buy(self, symbol: str, since: float,
+                                       stake: float | None = None, payout: float | None = None) -> dict | None:
         """A timed-out buy may still have gone through. Never retry (that can
-        open a second contract); look for it in the portfolio instead."""
+        open a second contract); look for it in the portfolio instead.
+
+        When stake/payout are given, a contract must also match them (to the
+        cent / within 1%). That stops this bot adopting a contract opened at
+        the same moment by ANOTHER bot sharing the same Deriv account."""
         known = {t.get("contract_id") for t in self.storage.open_trades(shadow=False)}
         for attempt in range(3):
             try:
@@ -346,7 +352,8 @@ class Bot:
                 sym = c.get("symbol") or c.get("underlying_symbol")
                 if (cid not in known and sym == symbol
                         and str(c.get("contract_type", "")).upper() == "EXPIRYRANGE"
-                        and float(c.get("purchase_time") or 0) >= since):
+                        and float(c.get("purchase_time") or 0) >= since
+                        and _matches_order(c, stake, payout)):
                     self.logger.warning(f"{symbol}: ambiguous buy DID go through -> contract {cid}")
                     return {"contract_id": cid, "buy_price": c.get("buy_price")}
             return None
@@ -431,6 +438,17 @@ class Bot:
             task.cancel()
         if self.client:
             await self.client.close()
+
+
+def _matches_order(contract: dict, stake, payout) -> bool:
+    """Same stake (to the cent) and same payout (within 1%) as the order we
+    placed. Missing values on either side are not used to reject."""
+    bp, po = _float_or_none(contract.get("buy_price")), _float_or_none(contract.get("payout"))
+    if stake is not None and bp is not None and abs(bp - float(stake)) > 0.005:
+        return False
+    if payout is not None and po is not None and po > 0 and abs(po - float(payout)) / po > 0.01:
+        return False
+    return True
 
 
 def _float_or_none(v):
