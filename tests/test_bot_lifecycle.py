@@ -112,6 +112,23 @@ def test_ambiguous_buy_finds_contract_in_portfolio(bot):
     assert asyncio.run(bot._reconcile_ambiguous_buy("RDBULL", since)) is None
 
 
+def test_ambiguous_buy_ignores_another_bots_contract(bot):
+    """Two bots on one Deriv account: same symbol, same moment, different
+    order -- the other bot's contract must not be adopted."""
+    since = time.time() - 5
+    now = time.time()
+    bot.client.portfolio_contracts = [
+        {"contract_id": 21, "symbol": "RDBULL", "contract_type": "EXPIRYRANGE",
+         "purchase_time": now, "buy_price": 1.00, "payout": 1.30},           # the other bot's
+        {"contract_id": 22, "symbol": "RDBULL", "contract_type": "EXPIRYRANGE",
+         "purchase_time": now, "buy_price": 0.35, "payout": 0.49},           # ours
+    ]
+    found = asyncio.run(bot._reconcile_ambiguous_buy("RDBULL", since, stake=0.35, payout=0.49))
+    assert found["contract_id"] == "22"
+    bot.client.portfolio_contracts = bot.client.portfolio_contracts[:1]
+    assert asyncio.run(bot._reconcile_ambiguous_buy("RDBULL", since, stake=0.35, payout=0.49)) is None
+
+
 def test_health_goes_stale(bot):
     assert bot.is_healthy()[0]
     bot.client.last_message_at = time.time() - 600
