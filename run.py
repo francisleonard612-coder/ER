@@ -43,7 +43,7 @@ class Bot:
         self.cfg = load_config()
         self.logger = setup_logging(self.cfg.log_level)
         self.sm = StateMachine(self.logger)
-        self.storage = Storage(self.cfg.database_url, self.cfg.sqlite_path, self.logger)
+        self.storage = Storage(self.cfg.database_url, self.cfg.sqlite_path, self.logger, schema=self.cfg.db_schema)
         self.calibration = CalibrationTracker(self.storage)
         self.staking = build_staking_engine(self.cfg.staking)
         self.client: DerivClient | None = None
