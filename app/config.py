@@ -5,6 +5,7 @@ env vars so the same image runs unmodified on Railway.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List
 
@@ -68,6 +69,10 @@ class Config:
     # --- persistence ---
     database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
     sqlite_path: str = field(default_factory=lambda: os.getenv("SQLITE_PATH", "data/expiryrange.db"))
+    # Postgres schema to keep this bot's tables in (e.g. "er", "er_gate").
+    # Lets several bots share ONE Supabase project without their tables
+    # (trades, rejected_signals, system_events...) colliding. Empty = public.
+    db_schema: str = field(default_factory=lambda: os.getenv("DB_SCHEMA", "").strip())
 
     # --- logging ---
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
@@ -144,6 +149,8 @@ class Config:
         if self.min_payout_multiplier < 1.0:
             problems.append("min_payout_multiplier must be >= 1.0.")
         problems += self.consolidation.validate()
+        if self.db_schema and not re.fullmatch(r"[a-z_][a-z0-9_]{0,62}", self.db_schema):
+            problems.append("DB_SCHEMA must be lowercase letters, digits and _ (e.g. er).")
         return problems
 
 
