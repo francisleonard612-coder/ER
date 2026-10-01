@@ -98,14 +98,23 @@ system_events = Table(
 
 
 class Storage:
-    def __init__(self, database_url: str, sqlite_path: str, logger):
+    def __init__(self, database_url: str, sqlite_path: str, logger, schema: str = ""):
         self.logger = logger
+        self.schema = None
         if database_url:
             url = database_url
             if url.startswith("postgres://"):  # SQLAlchemy wants postgresql://
                 url = url.replace("postgres://", "postgresql://", 1)
             self.engine = create_engine(url, pool_pre_ping=True)
-            self.logger.info("Storage: connected to external database via DATABASE_URL")
+            if schema:
+                # every table this bot touches lives in its own schema, so it can
+                # share a database with other bots that use the same table names
+                with self.engine.begin() as conn:
+                    conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+                self.engine = self.engine.execution_options(schema_translate_map={None: schema})
+                self.schema = schema
+            self.logger.info("Storage: connected to external database via DATABASE_URL"
+                             + (f" (schema {schema})" if schema else ""))
         else:
             self.engine = create_engine(f"sqlite:///{sqlite_path}", connect_args={"check_same_thread": False})
             self.logger.info(f"Storage: using local SQLite at {sqlite_path}")
@@ -121,17 +130,18 @@ class Storage:
         Adds any missing nullable columns in place. Additive only -- never
         drops or changes existing columns."""
         insp = inspect(self.engine)
-        existing_tables = set(insp.get_table_names())
+        existing_tables = set(insp.get_table_names(schema=self.schema))
         for table in metadata.sorted_tables:
             if table.name not in existing_tables:
                 continue
-            have = {c["name"] for c in insp.get_columns(table.name)}
+            have = {c["name"] for c in insp.get_columns(table.name, schema=self.schema)}
             for col in table.columns:
                 if col.name in have or col.primary_key:
                     continue
                 col_type = col.type.compile(dialect=self.engine.dialect)
                 with self.engine.begin() as conn:
-                    conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN {col.name} {col_type}'))
+                    target = f'"{self.schema}".{table.name}' if self.schema else table.name
+                    conn.execute(text(f'ALTER TABLE {target} ADD COLUMN {col.name} {col_type}'))
                 self.logger.info(f"Storage: migrated {table.name}.{col.name} ({col_type})")
 
     # ------------------------------------------------------------- trades
