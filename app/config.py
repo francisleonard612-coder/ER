@@ -115,6 +115,13 @@ class Config:
     non_calm_max_duration_minutes: int = int(os.getenv("NON_CALM_MAX_DURATION_MINUTES", "4"))
 
     durations_minutes: List[int] = field(default_factory=lambda: list(range(2, 11)))
+    # Duration priority: contracts this long or longer are priced and chosen
+    # first; shorter ones are a fallback, only priced when no longer contract
+    # passed this scan. 2 = no priority (old behaviour).
+    preferred_min_duration_minutes: int = int(os.getenv("PREFERRED_MIN_DURATION_MINUTES", "5"))
+    # how many shorter candidates to price as that fallback; 0 = never trade
+    # below preferred_min_duration_minutes
+    short_fallback_candidates: int = int(os.getenv("SHORT_FALLBACK_CANDIDATES", "3"))
     barrier_vol_multiples: List[float] = field(
         default_factory=lambda: [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
     )

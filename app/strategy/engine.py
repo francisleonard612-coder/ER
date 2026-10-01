@@ -85,7 +85,15 @@ async def run_scan_cycle(
     if not candidates:
         return ScanOutcome(symbol, False, None, [])
 
-    top = candidates[:MAX_CANDIDATES_TO_PRICE]
+    # DURATION PRIORITY: contracts of preferred_min_duration minutes or longer
+    # are priced first. Shorter ones are only priced (up to
+    # short_fallback_candidates of them) when no longer contract was accepted
+    # this scan, and a longer accepted contract always beats a shorter one.
+    pref_min = int(getattr(cfg, "preferred_min_duration_minutes", 0) or 0)
+    n_short = int(getattr(cfg, "short_fallback_candidates", MAX_CANDIDATES_TO_PRICE))
+    preferred = [c for c in candidates if c.duration_minutes >= pref_min]
+    shorter = [c for c in candidates if c.duration_minutes < pref_min]
+    stages = [preferred[:MAX_CANDIDATES_TO_PRICE], shorter[:max(n_short, 0)]]
 
     rejections = []
     best_accept = None
@@ -94,112 +102,116 @@ async def run_scan_cycle(
     # one DB read per scan instead of one per candidate
     calibration_buckets = calibration.snapshot()
 
-    for cand in top:
-        calibrated = calibration.calibrate(cand.mc.probability, buckets=calibration_buckets)
-        stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier,
-                                   consecutive_losses=consecutive_losses)
+    for top in stages:
+        for cand in top:
+            calibrated = calibration.calibrate(cand.mc.probability, buckets=calibration_buckets)
+            stake = staking.stake_for(edge=0.0, decision_score=calibrated, stake_multiplier=stake_multiplier,
+                                       consecutive_losses=consecutive_losses)
 
-        # Deriv rejects EXPIRYRANGE barrier offsets past a symbol-specific
-        # decimal limit (ContractBuyValidationError) -- confirmed different
-        # per symbol in production: R_10 accepted 3 places, 1HZ10V only 2.
-        # Rounding to 2 satisfies both observed limits; if a future symbol
-        # needs even less precision this will need per-symbol pip_size
-        # discovery via active_symbols rather than a single constant.
-        lower_offset = round(cand.lower_barrier - current_price, 2)
-        upper_offset = round(cand.upper_barrier - current_price, 2)
+            # Deriv rejects EXPIRYRANGE barrier offsets past a symbol-specific
+            # decimal limit (ContractBuyValidationError) -- confirmed different
+            # per symbol in production: R_10 accepted 3 places, 1HZ10V only 2.
+            # Rounding to 2 satisfies both observed limits; if a future symbol
+            # needs even less precision this will need per-symbol pip_size
+            # discovery via active_symbols rather than a single constant.
+            lower_offset = round(cand.lower_barrier - current_price, 2)
+            upper_offset = round(cand.upper_barrier - current_price, 2)
 
-        # A tight candidate (small volatility multiple on a low-volatility
-        # symbol) can round to a degenerate range at 3-decimal precision --
-        # zero width, or even inverted -- which is what Deriv's "This
-        # contract offers no return" rejection was: not a flaky error, but a
-        # real candidate that stopped being a valid range once rounded to
-        # the precision Deriv actually accepts. Skip it before spending a
-        # rate-limited request on something that cannot price.
-        if upper_offset <= lower_offset or lower_offset >= 0 or upper_offset <= 0:
-            continue
+            # A tight candidate (small volatility multiple on a low-volatility
+            # symbol) can round to a degenerate range at 3-decimal precision --
+            # zero width, or even inverted -- which is what Deriv's "This
+            # contract offers no return" rejection was: not a flaky error, but a
+            # real candidate that stopped being a valid range once rounded to
+            # the precision Deriv actually accepts. Skip it before spending a
+            # rate-limited request on something that cannot price.
+            if upper_offset <= lower_offset or lower_offset >= 0 or upper_offset <= 0:
+                continue
 
-        try:
-            proposal = await client.request_proposal(
-                symbol=symbol, duration_minutes=cand.duration_minutes, stake=stake,
-                lower_barrier=lower_offset,
-                upper_barrier=upper_offset,
+            try:
+                proposal = await client.request_proposal(
+                    symbol=symbol, duration_minutes=cand.duration_minutes, stake=stake,
+                    lower_barrier=lower_offset,
+                    upper_barrier=upper_offset,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"{symbol}: proposal request failed for candidate ({exc!r}) -- skipping candidate")
+                continue
+
+            payout = float(proposal.get("payout", 0.0))
+            proposal_id = proposal.get("id")
+            if payout <= 0 or not proposal_id:
+                continue
+
+            # Record the barriers Deriv was actually quoted -- the rounded
+            # offsets applied to Deriv's own reference spot -- not the unrounded
+            # candidate levels. These are what a shadow trade is later settled
+            # against, so they must match what the contract would really be.
+            try:
+                entry_spot = float(proposal.get("spot") or current_price)
+            except (TypeError, ValueError):
+                entry_spot = current_price
+            quoted_lower = entry_spot + lower_offset
+            quoted_upper = entry_spot + upper_offset
+
+            decision = evaluate(
+                calibrated_probability=calibrated,
+                probability_uncertainty=cand.mc.probability_uncertainty,
+                payout=payout,
+                stake=stake,
+                min_payout_multiplier=cfg.min_payout_multiplier,
+                min_edge=cfg.min_edge,
+                min_ev=cfg.min_ev,
+                max_probability_uncertainty=cfg.max_probability_uncertainty,
+                extra_edge_requirement=extra_edge_requirement,
+                model_disagreement=cand.mc.model_disagreement,
+                max_model_disagreement=cfg.max_model_disagreement,
+                regime_confidence=regime.confidence,
+                min_regime_confidence=cfg.min_regime_confidence_to_trade,
+                duration_minutes=cand.duration_minutes,
+                edge_duration_scaling=cfg.edge_duration_scaling,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"{symbol}: proposal request failed for candidate ({exc!r}) -- skipping candidate")
-            continue
 
-        payout = float(proposal.get("payout", 0.0))
-        proposal_id = proposal.get("id")
-        if payout <= 0 or not proposal_id:
-            continue
+            row = {
+                "trade_id": str(uuid.uuid4()),
+                "symbol": symbol,
+                "entry_price": entry_spot,
+                "duration_minutes": cand.duration_minutes,
+                "lower_barrier": quoted_lower,
+                "upper_barrier": quoted_upper,
+                "stake": stake,
+                "proposal_id": proposal_id,
+                "payout": payout,
+                "payout_multiplier": decision.payout_multiplier,
+                "raw_probability": cand.mc.probability,
+                "calibrated_probability": calibrated,
+                "implied_probability": decision.implied_probability,
+                "edge": decision.edge,
+                "expected_value": decision.expected_value,
+                "regime": regime.regime.value,
+                "regime_confidence": regime.confidence,
+                "volatility": current_vol,
+                "model_disagreement": cand.mc.model_disagreement,
+                "mc_path_count": cand.mc.path_count,
+                "decision_score": decision.expected_value,
+                "model_version": "v2",
+            }
 
-        # Record the barriers Deriv was actually quoted -- the rounded
-        # offsets applied to Deriv's own reference spot -- not the unrounded
-        # candidate levels. These are what a shadow trade is later settled
-        # against, so they must match what the contract would really be.
-        try:
-            entry_spot = float(proposal.get("spot") or current_price)
-        except (TypeError, ValueError):
-            entry_spot = current_price
-        quoted_lower = entry_spot + lower_offset
-        quoted_upper = entry_spot + upper_offset
+            logger.info(
+                f"{symbol} | dur={cand.duration_minutes}m | barriers=[{cand.lower_barrier:.4f},{cand.upper_barrier:.4f}] "
+                f"| regime={regime.regime.value}({regime.confidence:.2f}) | vol={current_vol:.5f} | "
+                f"raw_p={cand.mc.probability:.3f} cal_p={calibrated:.3f} implied_p={decision.implied_probability:.3f} "
+                f"edge={decision.edge:+.3f} payout_x={decision.payout_multiplier:.3f} ev={decision.expected_value:+.4f} "
+                f"-> {decision.reason}"
+            )
 
-        decision = evaluate(
-            calibrated_probability=calibrated,
-            probability_uncertainty=cand.mc.probability_uncertainty,
-            payout=payout,
-            stake=stake,
-            min_payout_multiplier=cfg.min_payout_multiplier,
-            min_edge=cfg.min_edge,
-            min_ev=cfg.min_ev,
-            max_probability_uncertainty=cfg.max_probability_uncertainty,
-            extra_edge_requirement=extra_edge_requirement,
-            model_disagreement=cand.mc.model_disagreement,
-            max_model_disagreement=cfg.max_model_disagreement,
-            regime_confidence=regime.confidence,
-            min_regime_confidence=cfg.min_regime_confidence_to_trade,
-            duration_minutes=cand.duration_minutes,
-            edge_duration_scaling=cfg.edge_duration_scaling,
-        )
+            if decision.accept and (best_accept is None or decision.expected_value > best_accept.expected_value):
+                best_accept = decision
+                best_row = row
+            elif not decision.accept:
+                rejections.append({**row, "rejection_reason": decision.reason})
 
-        row = {
-            "trade_id": str(uuid.uuid4()),
-            "symbol": symbol,
-            "entry_price": entry_spot,
-            "duration_minutes": cand.duration_minutes,
-            "lower_barrier": quoted_lower,
-            "upper_barrier": quoted_upper,
-            "stake": stake,
-            "proposal_id": proposal_id,
-            "payout": payout,
-            "payout_multiplier": decision.payout_multiplier,
-            "raw_probability": cand.mc.probability,
-            "calibrated_probability": calibrated,
-            "implied_probability": decision.implied_probability,
-            "edge": decision.edge,
-            "expected_value": decision.expected_value,
-            "regime": regime.regime.value,
-            "regime_confidence": regime.confidence,
-            "volatility": current_vol,
-            "model_disagreement": cand.mc.model_disagreement,
-            "mc_path_count": cand.mc.path_count,
-            "decision_score": decision.expected_value,
-            "model_version": "v2",
-        }
-
-        logger.info(
-            f"{symbol} | dur={cand.duration_minutes}m | barriers=[{cand.lower_barrier:.4f},{cand.upper_barrier:.4f}] "
-            f"| regime={regime.regime.value}({regime.confidence:.2f}) | vol={current_vol:.5f} | "
-            f"raw_p={cand.mc.probability:.3f} cal_p={calibrated:.3f} implied_p={decision.implied_probability:.3f} "
-            f"edge={decision.edge:+.3f} payout_x={decision.payout_multiplier:.3f} ev={decision.expected_value:+.4f} "
-            f"-> {decision.reason}"
-        )
-
-        if decision.accept and (best_accept is None or decision.expected_value > best_accept.expected_value):
-            best_accept = decision
-            best_row = row
-        elif not decision.accept:
-            rejections.append({**row, "rejection_reason": decision.reason})
+        if best_accept is not None:
+            break  # a preferred-duration trade was accepted; shorter ones aren't priced
 
     if best_accept is not None:
         return ScanOutcome(symbol, True, best_row, rejections)
