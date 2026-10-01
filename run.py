@@ -31,7 +31,8 @@ from app.strategy.risk import exposure_allows, utc_day_start
 from app.strategy.staking import build_staking_engine
 
 CANDLE_GRANULARITY_SECONDS = 60
-CANDLE_HISTORY_COUNT = 300
+CANDLE_HISTORY_COUNT = 600   # fetched; the consolidation gate uses all of it (ATR(100), squeeze percentile)
+MC_HISTORY_COUNT = 300       # what the Monte Carlo / regime layers see -- unchanged from before the gate
 SHADOW_RESOLVE_INTERVAL_SECONDS = 10
 SHADOW_RESOLVE_GRACE_SECONDS = 3      # let the expiry tick land before asking for it
 STATS_LOG_INTERVAL_SECONDS = 15 * 60
@@ -48,6 +49,7 @@ class Bot:
         self.staking = build_staking_engine(self.cfg.staking)
         self.client: DerivClient | None = None
         self.closes_by_symbol: dict[str, deque] = {}
+        self.ohlc_by_symbol: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         # trade_id -> symbol for every position occupying a slot. Shadow
         # trades occupy slots too, until resolved: otherwise shadow mode
         # opens a new overlapping trade every scan, which live mode never
@@ -140,6 +142,11 @@ class Bot:
         buf.clear()
         for c in candles:
             buf.append(float(c["close"]))
+        self.ohlc_by_symbol[symbol] = (
+            np.array([float(c["high"]) for c in candles]),
+            np.array([float(c["low"]) for c in candles]),
+            np.array([float(c["close"]) for c in candles]),
+        )
 
     async def _restore_open_positions(self):
         """Previously, open-contract tracking lived only in memory: after a
@@ -184,9 +191,10 @@ class Bot:
             return
 
         await self._refresh_candles(symbol)
-        closes = np.array(self.closes_by_symbol.get(symbol, ()), dtype=float)
-        if len(closes) == 0:
+        closes_all = np.array(self.closes_by_symbol.get(symbol, ()), dtype=float)
+        if len(closes_all) == 0:
             return
+        closes = closes_all[-MC_HISTORY_COUNT:]
         current_price = closes[-1]
 
         shadow = self.cfg.shadow_mode
@@ -201,6 +209,7 @@ class Bot:
                 extra_edge_requirement=self.sm.extra_edge_requirement(),
                 logger=self.logger,
                 consecutive_losses=consecutive_losses,
+                ohlc=self.ohlc_by_symbol.get(symbol),
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"{symbol}: scan cycle failed (non-fatal): {exc!r}")
@@ -215,6 +224,7 @@ class Bot:
                 "payout": rej["payout"], "implied_probability": rej["implied_probability"],
                 "edge": rej["edge"], "expected_value": rej["expected_value"], "regime": rej["regime"],
                 "rejection_reason": rej["rejection_reason"],
+                **{k: v for k, v in rej.items() if k.startswith("cons_")},
             })
 
         # consecutive-loss caution (temporary, auto-recovering -- section 8/29)

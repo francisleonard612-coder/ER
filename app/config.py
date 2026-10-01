@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from typing import List
 
+from app.features.consolidation import ConsolidationConfig
+
 
 def _env_bool(name: str, default: bool) -> bool:
     val = os.getenv(name)
@@ -128,6 +130,7 @@ class Config:
 
     staking: StakingConfig = field(default_factory=StakingConfig)
     monte_carlo: MonteCarloConfig = field(default_factory=MonteCarloConfig)
+    consolidation: ConsolidationConfig = field(default_factory=ConsolidationConfig)
 
     def is_live(self) -> bool:
         return self.account_mode == "LIVE"
@@ -140,6 +143,7 @@ class Config:
             problems.append("initial_stake below minimum_stake.")
         if self.min_payout_multiplier < 1.0:
             problems.append("min_payout_multiplier must be >= 1.0.")
+        problems += self.consolidation.validate()
         return problems
 
 

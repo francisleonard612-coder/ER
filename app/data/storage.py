@@ -59,6 +59,19 @@ trades = Table(
     Column("opened_at", Float),
     Column("expires_at", Float),
     Column("exit_spot", Float),
+    # consolidation gate readings (app/features/consolidation.py)
+    Column("cons_er", Float),
+    Column("cons_bbw_pct", Float),
+    Column("cons_atr_ratio_pct", Float),
+    Column("cons_adx", Float),
+    Column("cons_ema_gap_atr", Float),
+    Column("cons_ema_slope_atr", Float),
+    Column("cons_macd_hist_atr", Float),
+    Column("cons_macd_crossings", Integer),
+    Column("cons_hurst", Float),
+    Column("cons_passed", Integer),
+    Column("cons_score", Integer),
+    Column("cons_checks", String),
 )
 
 rejected_signals = Table(
@@ -77,6 +90,19 @@ rejected_signals = Table(
     Column("expected_value", Float),
     Column("regime", String),
     Column("rejection_reason", String),
+    # consolidation gate readings (app/features/consolidation.py)
+    Column("cons_er", Float),
+    Column("cons_bbw_pct", Float),
+    Column("cons_atr_ratio_pct", Float),
+    Column("cons_adx", Float),
+    Column("cons_ema_gap_atr", Float),
+    Column("cons_ema_slope_atr", Float),
+    Column("cons_macd_hist_atr", Float),
+    Column("cons_macd_crossings", Integer),
+    Column("cons_hurst", Float),
+    Column("cons_passed", Integer),
+    Column("cons_score", Integer),
+    Column("cons_checks", String),
 )
 
 calibration_buckets = Table(

@@ -14,6 +14,7 @@ from typing import List, Optional
 import numpy as np
 
 from app.deriv.client import DerivClient
+from app.features.consolidation import assess as assess_consolidation
 from app.features.stats import detect_regime, log_returns, realized_volatility
 from app.models.calibration import CalibrationTracker
 from app.optimizer.candidate import BarrierCandidate, build_candidates
@@ -58,10 +59,24 @@ async def run_scan_cycle(
     extra_edge_requirement: float,
     logger,
     consecutive_losses: int = 0,
+    ohlc: Optional[tuple] = None,
 ) -> ScanOutcome:
     if len(closes) < 70:
         logger.info(f"{symbol}: warming up, insufficient history ({len(closes)} candles)")
         return ScanOutcome(symbol, False, None, [])
+
+    # Consolidation gate (app/features/consolidation.py). Runs BEFORE the
+    # Monte Carlo search: when it blocks, no simulation and no Deriv proposal
+    # requests are spent. In "log" mode it never blocks, only records.
+    ccfg = getattr(cfg, "consolidation", None)
+    cons_cols: dict = {}
+    if ccfg is not None and ccfg.mode != "off" and ohlc is not None:
+        reading = assess_consolidation(*ohlc, ccfg)
+        cons_cols = reading.as_row()
+        if ccfg.mode == "on" and not reading.passed:
+            logger.info(f"{symbol}: GATE CLOSED -- {reading.reason} | {reading.summary()}")
+            return ScanOutcome(symbol, False, None, [])
+        logger.info(f"{symbol}: GATE {'OPEN' if reading.passed else 'LOG'} -- {reading.reason} | {reading.summary()}")
 
     rets = log_returns(closes)
     current_vol = realized_volatility(rets[-20:]) if len(rets) >= 20 else realized_volatility(rets)
@@ -185,6 +200,7 @@ async def run_scan_cycle(
             "mc_path_count": cand.mc.path_count,
             "decision_score": decision.expected_value,
             "model_version": "v2",
+            **cons_cols,
         }
 
         logger.info(
