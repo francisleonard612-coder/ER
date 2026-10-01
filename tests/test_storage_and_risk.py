@@ -100,3 +100,41 @@ def test_db_url_normalized_to_installed_driver():
     for scheme in ("postgres", "postgresql", "postgresql+psycopg", "postgresql+psycopg2", "postgresql+asyncpg"):
         assert normalize_db_url(f" {scheme}://{tail} ") == f"postgresql+psycopg2://{tail}"
     assert normalize_db_url("sqlite:///x.db") == "sqlite:///x.db"
+
+
+def test_numpy_values_never_reach_the_database_driver(tmp_path):
+    """Regression: Supabase/psycopg2 crashed on np.float64 ('schema "np" does
+    not exist'). Every write must hand the driver plain Python numbers."""
+    import logging
+    import uuid
+
+    import numpy as np
+    from sqlalchemy import event
+
+    from app.data.storage import Storage
+
+    s = Storage("", str(tmp_path / "np.db"), logging.getLogger("t"))
+    s.init_schema()
+    seen = []
+
+    @event.listens_for(s.engine, "before_cursor_execute")
+    def _capture(conn, cursor, statement, params, context, executemany):
+        seen.append(params)
+
+    tid = str(uuid.uuid4())
+    s.record_trade({"trade_id": tid, "symbol": "R_10", "stake": np.float64(0.35),
+                    "duration_minutes": np.int64(4), "edge": np.float32(0.06), "shadow": 0})
+    s.settle_trade(tid, "WIN", np.float64(0.12), balance_after=np.float64(10.5), exit_spot=np.float64(1.2))
+    s.record_rejection({"symbol": "R_10", "duration_minutes": np.int64(4), "lower_barrier": np.float64(1.0),
+                        "edge": np.float64(-0.01), "rejection_reason": "INSUFFICIENT EDGE"})
+    s.log_event("INFO", "x", {"v": np.float64(1.5), "n": [np.int64(2)]})
+
+    flat = []
+    for p in seen:
+        if isinstance(p, dict):
+            flat += list(p.values())
+        elif isinstance(p, (list, tuple)):
+            for q in p:
+                flat += list(q.values()) if isinstance(q, dict) else (list(q) if isinstance(q, (list, tuple)) else [q])
+    assert flat, "no parameters captured"
+    assert not [v for v in flat if isinstance(v, np.generic)]
