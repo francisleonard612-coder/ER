@@ -13,6 +13,8 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
 from sqlalchemy import (
     JSON, Column, DateTime, Float, Integer, MetaData, String, Table, create_engine, func as sa_func,
     inspect, insert, select, text, update
@@ -123,6 +125,22 @@ system_events = Table(
 )
 
 
+def _plain(v: Any) -> Any:
+    """numpy scalars -> plain Python values, recursively through dicts/lists.
+
+    psycopg2 renders a numpy float64 as the literal text np.float64(1.23),
+    which Postgres parses as a function in a schema called "np":
+    'schema "np" does not exist'. SQLite accepted them, so this only
+    surfaced when ER moved to Supabase. Every write goes through this."""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, dict):
+        return {k: _plain(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return type(v)(_plain(x) for x in v)
+    return v
+
+
 def normalize_db_url(url: str) -> str:
     """Any Postgres URL form -> the driver this bot ships with (psycopg2).
 
@@ -186,7 +204,7 @@ class Storage:
     # ------------------------------------------------------------- trades
     def record_trade(self, row: Dict[str, Any]) -> None:
         with self.engine.begin() as conn:
-            conn.execute(insert(trades).values(**row))
+            conn.execute(insert(trades).values(**_plain(row)))
 
     def settle_trade(self, trade_id: str, result: str, profit_loss: float,
                      balance_after: Optional[float] = None, exit_spot: Optional[float] = None) -> bool:
@@ -202,7 +220,8 @@ class Storage:
                 update(trades)
                 .where(trades.c.trade_id == trade_id)
                 .where(trades.c.result == "OPEN")
-                .values(result=result, profit_loss=profit_loss, balance_after=balance_after, exit_spot=exit_spot)
+                .values(**_plain(dict(result=result, profit_loss=profit_loss, balance_after=balance_after,
+                                     exit_spot=exit_spot)))
             )
         return (res.rowcount or 0) > 0
 
@@ -299,7 +318,7 @@ class Storage:
     # -------------------------------------------------------- rejections
     def record_rejection(self, row: Dict[str, Any]) -> None:
         with self.engine.begin() as conn:
-            conn.execute(insert(rejected_signals).values(**row))
+            conn.execute(insert(rejected_signals).values(**_plain(row)))
 
     # -------------------------------------------------------- calibration
     def update_calibration(self, bucket: str, won: bool) -> None:
@@ -331,4 +350,4 @@ class Storage:
     # ------------------------------------------------------------- events
     def log_event(self, level: str, message: str, context: Optional[dict] = None) -> None:
         with self.engine.begin() as conn:
-            conn.execute(insert(system_events).values(level=level, message=message, context=context or {}))
+            conn.execute(insert(system_events).values(level=level, message=message, context=_plain(context or {})))
