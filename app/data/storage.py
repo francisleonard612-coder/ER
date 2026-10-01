@@ -97,14 +97,27 @@ system_events = Table(
 )
 
 
+def normalize_db_url(url: str) -> str:
+    """Any Postgres URL form -> the driver this bot ships with (psycopg2).
+
+    A connection string copied from another service may name a different
+    driver -- Reversal-System's uses postgresql+psycopg:// (psycopg 3), which
+    is not installed here and crashed startup with "No module named
+    'psycopg'". Heroku/Supabase-style postgres:// is also accepted."""
+    url = url.strip()
+    scheme, sep, rest = url.partition("://")
+    if sep and scheme.split("+")[0] in ("postgres", "postgresql"):
+        return "postgresql+psycopg2://" + rest
+    return url
+
+
 class Storage:
     def __init__(self, database_url: str, sqlite_path: str, logger, schema: str = ""):
         self.logger = logger
         self.schema = None
         if database_url:
             url = database_url
-            if url.startswith("postgres://"):  # SQLAlchemy wants postgresql://
-                url = url.replace("postgres://", "postgresql://", 1)
+            url = normalize_db_url(url)
             self.engine = create_engine(url, pool_pre_ping=True)
             if schema:
                 # every table this bot touches lives in its own schema, so it can

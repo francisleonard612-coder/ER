@@ -92,3 +92,11 @@ def test_exposure_cap():
 def test_utc_day_start():
     # 2026-09-28 10:24:00 UTC
     assert utc_day_start(1790591040.0) == 1790553600.0
+
+
+def test_db_url_normalized_to_installed_driver():
+    from app.data.storage import normalize_db_url
+    tail = "user:pw@aws-0-eu.pooler.supabase.com:6543/postgres"
+    for scheme in ("postgres", "postgresql", "postgresql+psycopg", "postgresql+psycopg2", "postgresql+asyncpg"):
+        assert normalize_db_url(f" {scheme}://{tail} ") == f"postgresql+psycopg2://{tail}"
+    assert normalize_db_url("sqlite:///x.db") == "sqlite:///x.db"
